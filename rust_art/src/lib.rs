@@ -393,6 +393,32 @@ impl<V> ARTMap<V> {
         }
         None
     }
+
+    /// Iterate all (key, value) pairs in sorted key order.
+    pub fn items(&self) -> Vec<(&[u8], &V)> {
+        let mut result = Vec::new();
+        unsafe { iter_all(self.root, &mut result) };
+        result
+    }
+}
+
+/// Recursively collect all (key, value) pairs in sorted order.
+unsafe fn iter_all<'a, V>(node: NodePtr<V>, out: &mut Vec<(&'a [u8], &'a V)>) {
+    if node.is_null() {
+        return;
+    }
+    if node.is_leaf() {
+        let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
+        out.push((&leaf.key, &leaf.value));
+        return;
+    }
+    // Inner node: own value first (shorter key sorts before children)
+    if let Some((k, v)) = inner_value_raw(node) {
+        out.push((k.as_slice(), v));
+    }
+    for (_, child) in inner_children(&node) {
+        iter_all(child, out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1495,5 +1521,80 @@ mod tests {
         assert_eq!(tree.len(), 0);
         tree.put(b"fresh", 1);
         assert_eq!(tree.get(b"fresh"), Some(&1));
+    }
+
+    // -- iteration tests --
+
+    #[test]
+    fn items_empty() {
+        let tree: ARTMap<i32> = ARTMap::new();
+        assert!(tree.items().is_empty());
+    }
+
+    #[test]
+    fn items_sorted_order() {
+        let mut tree = ARTMap::new();
+        tree.put(b"c", 3);
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        let items: Vec<_> = tree.items().into_iter().map(|(k, &v)| (k, v)).collect();
+        assert_eq!(items, vec![(b"a".as_slice(), 1), (b"b".as_slice(), 2), (b"c".as_slice(), 3)]);
+    }
+
+    #[test]
+    fn items_with_prefix_keys() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"ab", 2);
+        tree.put(b"abc", 3);
+        let keys: Vec<_> = tree.items().into_iter().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(keys, vec![b"a".to_vec(), b"ab".to_vec(), b"abc".to_vec()]);
+    }
+
+    #[test]
+    fn items_empty_key_first() {
+        let mut tree = ARTMap::new();
+        tree.put(b"", 0);
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        let keys: Vec<_> = tree.items().into_iter().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(keys, vec![b"".to_vec(), b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn items_after_deletes() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        tree.put(b"c", 3);
+        tree.delete(b"b");
+        let keys: Vec<_> = tree.items().into_iter().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(keys, vec![b"a".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn items_after_growth() {
+        let mut tree = ARTMap::new();
+        let mut keys: Vec<Vec<u8>> = (0..49u8).map(|i| vec![b'A' + i]).collect();
+        for (i, k) in keys.iter().enumerate() {
+            tree.put(k, i as i32);
+        }
+        let result: Vec<Vec<u8>> = tree.items().into_iter().map(|(k, _)| k.to_vec()).collect();
+        keys.sort();
+        assert_eq!(result, keys);
+    }
+
+    #[test]
+    fn items_1000_sorted() {
+        let mut tree = ARTMap::new();
+        let mut keys: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("key{:04}", i).into_bytes())
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            tree.put(k, i);
+        }
+        let result: Vec<Vec<u8>> = tree.items().into_iter().map(|(k, _)| k.to_vec()).collect();
+        keys.sort();
+        assert_eq!(result, keys);
     }
 }
