@@ -345,6 +345,15 @@ impl<V> ARTMap<V> {
         }
     }
 
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        let (new_root, deleted) = delete_recursive(self.root, key, 0);
+        self.root = new_root;
+        if deleted {
+            self.len -= 1;
+        }
+        deleted
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<&V> {
         // Safety: all NodePtrs stored in the tree point to valid heap allocations
         // that live as long as &self. We use unsafe to tie the returned reference
@@ -595,27 +604,10 @@ fn inner_has_value<V>(node: &NodePtr<V>) -> bool {
     }
 }
 
-/// Copy header (prefix + value) from one inner node ptr to another.
-fn inner_copy_header<V>(src: &NodePtr<V>, dst: &mut NodePtr<V>) {
-    let (prefix, value) = match src.kind() {
-        KIND_NODE4 => {
-            let s = src.as_node4();
-            (s.prefix.clone(), s.value.take_from_ref())
-        }
-        KIND_NODE16 => {
-            let s = src.as_node16();
-            (s.prefix.clone(), s.value.take_from_ref())
-        }
-        KIND_NODE48 => {
-            let s = src.as_node48();
-            (s.prefix.clone(), s.value.take_from_ref())
-        }
-        KIND_NODE256 => {
-            let s = src.as_node256();
-            (s.prefix.clone(), s.value.take_from_ref())
-        }
-        _ => unreachable!(),
-    };
+/// Move header (prefix + value) from src to dst. Src's prefix/value become empty/None.
+fn inner_move_header<V>(src: &mut NodePtr<V>, dst: &mut NodePtr<V>) {
+    let prefix = inner_take_prefix(src);
+    let value = inner_clear_value(src);
     inner_set_prefix(dst, prefix);
     match dst.kind() {
         KIND_NODE4 => dst.as_node4_mut().value = value,
@@ -626,18 +618,6 @@ fn inner_copy_header<V>(src: &NodePtr<V>, dst: &mut NodePtr<V>) {
     }
 }
 
-// We can't "take" from a shared ref without unsafe. For inner_copy_header we need
-// to read prefix/value from the source and write to destination. Since this is called
-// during grow/shrink where the source is about to be dropped, we use ptr::read.
-trait TakeFromRef<T> {
-    fn take_from_ref(&self) -> T;
-}
-impl<V> TakeFromRef<InnerValue<V>> for InnerValue<V> {
-    fn take_from_ref(&self) -> InnerValue<V> {
-        unsafe { std::ptr::read(self) }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Node growth
 // ---------------------------------------------------------------------------
@@ -645,49 +625,39 @@ impl<V> TakeFromRef<InnerValue<V>> for InnerValue<V> {
 fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
     match node.kind() {
         KIND_NODE4 => {
-            let mut new = Box::new(Node16::<V>::new());
-            let mut new_ptr = NodePtr::from_node16(new);
-            inner_copy_header(&node, &mut new_ptr);
+            let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
+            inner_move_header(&mut node, &mut new_ptr);
             let old = node.as_node4();
             let cnt = old.count as usize;
-            // Copy children (already sorted in Node4)
             {
                 let dst = new_ptr.as_node16_mut();
                 dst.keys[..cnt].copy_from_slice(&old.keys[..cnt]);
                 dst.children[..cnt].copy_from_slice(&old.children[..cnt]);
                 dst.count = cnt as u8;
             }
-            // Free old node without dropping children
-            let mut old_box = node.into_node4_box();
-            old_box.count = 0; // prevent child cleanup
-            old_box.value = None;
-            drop(old_box);
+            free_inner_node_shell(node);
             new_ptr
         }
         KIND_NODE16 => {
             let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
-            inner_copy_header(&node, &mut new_ptr);
+            inner_move_header(&mut node, &mut new_ptr);
             let old = node.as_node16();
             let cnt = old.count as usize;
             {
                 let dst = new_ptr.as_node48_mut();
                 for i in 0..cnt {
                     let b = old.keys[i];
-                    // Find free slot (they're all free in new node)
                     dst.index[b as usize] = i as u8;
                     dst.slots[i] = old.children[i];
                 }
                 dst.count = cnt as u8;
             }
-            let mut old_box = node.into_node16_box();
-            old_box.count = 0;
-            old_box.value = None;
-            drop(old_box);
+            free_inner_node_shell(node);
             new_ptr
         }
         KIND_NODE48 => {
             let mut new_ptr = NodePtr::from_node256(Box::new(Node256::<V>::new()));
-            inner_copy_header(&node, &mut new_ptr);
+            inner_move_header(&mut node, &mut new_ptr);
             let old = node.as_node48();
             {
                 let dst = new_ptr.as_node256_mut();
@@ -701,16 +671,332 @@ fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
                 }
                 dst.count = cnt;
             }
-            let mut old_box = node.into_node48_box();
-            old_box.count = 0;
-            old_box.value = None;
-            // Clear index so drop_recursive won't touch children
-            old_box.index = [0xFF; 256];
-            drop(old_box);
+            free_inner_node_shell(node);
             new_ptr
         }
         _ => unreachable!("Node256 cannot grow"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Node shrinkage
+// ---------------------------------------------------------------------------
+
+fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+    match node.kind() {
+        KIND_NODE256 => {
+            let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
+            inner_move_header(&mut node, &mut new_ptr);
+            let old = node.as_node256();
+            {
+                let dst = new_ptr.as_node48_mut();
+                let mut slot = 0u8;
+                for b in 0..256usize {
+                    if !old.children[b].is_null() {
+                        dst.index[b] = slot;
+                        dst.slots[slot as usize] = old.children[b];
+                        slot += 1;
+                    }
+                }
+                dst.count = slot;
+            }
+            free_inner_node_shell(node);
+            new_ptr
+        }
+        KIND_NODE48 => {
+            let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
+            inner_move_header(&mut node, &mut new_ptr);
+            let old = node.as_node48();
+            {
+                let dst = new_ptr.as_node16_mut();
+                let mut cnt = 0usize;
+                for b in 0..256usize {
+                    let idx = old.index[b];
+                    if idx != 0xFF {
+                        dst.keys[cnt] = b as u8;
+                        dst.children[cnt] = old.slots[idx as usize];
+                        cnt += 1;
+                    }
+                }
+                dst.count = cnt as u8;
+            }
+            free_inner_node_shell(node);
+            new_ptr
+        }
+        KIND_NODE16 => {
+            let mut new_ptr = NodePtr::from_node4(Box::new(Node4::<V>::new()));
+            inner_move_header(&mut node, &mut new_ptr);
+            let old = node.as_node16();
+            let cnt = old.count as usize;
+            {
+                let dst = new_ptr.as_node4_mut();
+                dst.keys[..cnt].copy_from_slice(&old.keys[..cnt]);
+                dst.children[..cnt].copy_from_slice(&old.children[..cnt]);
+                dst.count = cnt as u8;
+            }
+            free_inner_node_shell(node);
+            new_ptr
+        }
+        _ => node, // Node4 cannot shrink further
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remove child from inner node
+// ---------------------------------------------------------------------------
+
+fn inner_remove_child<V>(node: &mut NodePtr<V>, b: u8) {
+    match node.kind() {
+        KIND_NODE4 => {
+            let n = node.as_node4_mut();
+            let cnt = n.count as usize;
+            if let Some(pos) = n.keys[..cnt].iter().position(|&k| k == b) {
+                for i in pos..cnt - 1 {
+                    n.keys[i] = n.keys[i + 1];
+                    n.children[i] = n.children[i + 1];
+                }
+                n.children[cnt - 1] = NodePtr::NULL;
+                n.count -= 1;
+            }
+        }
+        KIND_NODE16 => {
+            let n = node.as_node16_mut();
+            let cnt = n.count as usize;
+            if let Ok(pos) = n.keys[..cnt].binary_search(&b) {
+                for i in pos..cnt - 1 {
+                    n.keys[i] = n.keys[i + 1];
+                    n.children[i] = n.children[i + 1];
+                }
+                n.children[cnt - 1] = NodePtr::NULL;
+                n.count -= 1;
+            }
+        }
+        KIND_NODE48 => {
+            let n = node.as_node48_mut();
+            let idx = n.index[b as usize];
+            if idx != 0xFF {
+                n.slots[idx as usize] = NodePtr::NULL;
+                n.index[b as usize] = 0xFF;
+                n.count -= 1;
+            }
+        }
+        KIND_NODE256 => {
+            let n = node.as_node256_mut();
+            if !n.children[b as usize].is_null() {
+                n.children[b as usize] = NodePtr::NULL;
+                n.count -= 1;
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Return (byte, child) pairs in sorted byte order.
+fn inner_children<V>(node: &NodePtr<V>) -> Vec<(u8, NodePtr<V>)> {
+    match node.kind() {
+        KIND_NODE4 => {
+            let n = node.as_node4();
+            let cnt = n.count as usize;
+            (0..cnt).map(|i| (n.keys[i], n.children[i])).collect()
+        }
+        KIND_NODE16 => {
+            let n = node.as_node16();
+            let cnt = n.count as usize;
+            (0..cnt).map(|i| (n.keys[i], n.children[i])).collect()
+        }
+        KIND_NODE48 => {
+            let n = node.as_node48();
+            let mut out = Vec::new();
+            for b in 0..256usize {
+                let idx = n.index[b];
+                if idx != 0xFF {
+                    out.push((b as u8, n.slots[idx as usize]));
+                }
+            }
+            out
+        }
+        KIND_NODE256 => {
+            let n = node.as_node256();
+            let mut out = Vec::new();
+            for b in 0..256usize {
+                if !n.children[b].is_null() {
+                    out.push((b as u8, n.children[b]));
+                }
+            }
+            out
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn inner_clear_value<V>(node: &mut NodePtr<V>) -> InnerValue<V> {
+    match node.kind() {
+        KIND_NODE4 => node.as_node4_mut().value.take(),
+        KIND_NODE16 => node.as_node16_mut().value.take(),
+        KIND_NODE48 => node.as_node48_mut().value.take(),
+        KIND_NODE256 => node.as_node256_mut().value.take(),
+        _ => unreachable!(),
+    }
+}
+
+/// Get prefix, consuming it (replacing with empty vec).
+fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Vec<u8> {
+    match node.kind() {
+        KIND_NODE4 => std::mem::take(&mut node.as_node4_mut().prefix),
+        KIND_NODE16 => std::mem::take(&mut node.as_node16_mut().prefix),
+        KIND_NODE48 => std::mem::take(&mut node.as_node48_mut().prefix),
+        KIND_NODE256 => std::mem::take(&mut node.as_node256_mut().prefix),
+        _ => unreachable!(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compact after deletion
+// ---------------------------------------------------------------------------
+
+/// Collapse a node that became degenerate after a child removal.
+fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+    let count = inner_count(&node);
+
+    if count == 0 {
+        if inner_has_value(&node) {
+            // Convert to leaf
+            let val = inner_clear_value(&mut node);
+            // Free the inner node
+            free_inner_node_shell(node);
+            let (k, v) = val.unwrap();
+            return NodePtr::from_leaf(Box::new(Leaf { key: k, value: v }));
+        }
+        // Totally empty — free and return null
+        free_inner_node_shell(node);
+        return NodePtr::NULL;
+    }
+
+    if count == 1 && !inner_has_value(&node) {
+        let children = inner_children(&node);
+        let (b, child) = children[0];
+        if child.is_leaf() {
+            // Single leaf child, no value: collapse to just the leaf
+            free_inner_node_shell(node);
+            return child;
+        }
+        // Single inner child: merge prefixes: parent.prefix + byte + child.prefix
+        let parent_prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+        free_inner_node_shell(node);
+        let mut child = child;
+        let child_prefix = inner_take_prefix(&mut child);
+        let mut merged = parent_prefix;
+        merged.push(b);
+        merged.extend_from_slice(&child_prefix);
+        inner_set_prefix(&mut child, merged);
+        return child;
+    }
+
+    // Check shrink thresholds
+    let should_shrink = match node.kind() {
+        KIND_NODE256 => count <= 48,
+        KIND_NODE48 => count <= 16,
+        KIND_NODE16 => count <= 4,
+        _ => false,
+    };
+    if should_shrink {
+        return shrink(node);
+    }
+
+    node
+}
+
+/// Free an inner node's Box without recursively dropping children.
+fn free_inner_node_shell<V>(node: NodePtr<V>) {
+    match node.kind() {
+        KIND_NODE4 => {
+            let mut b = node.into_node4_box();
+            b.count = 0;
+            b.value = None;
+            drop(b);
+        }
+        KIND_NODE16 => {
+            let mut b = node.into_node16_box();
+            b.count = 0;
+            b.value = None;
+            drop(b);
+        }
+        KIND_NODE48 => {
+            let mut b = node.into_node48_box();
+            b.count = 0;
+            b.value = None;
+            b.index = [0xFF; 256];
+            drop(b);
+        }
+        KIND_NODE256 => {
+            let mut b = node.into_node256_box();
+            b.count = 0;
+            b.value = None;
+            for c in b.children.iter_mut() {
+                *c = NodePtr::NULL;
+            }
+            drop(b);
+        }
+        _ => unreachable!(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recursive delete
+// ---------------------------------------------------------------------------
+
+/// Returns (new_node_or_null, was_deleted)
+fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V>, bool) {
+    if node.is_null() {
+        return (NodePtr::NULL, false);
+    }
+
+    if node.is_leaf() {
+        if node.as_leaf().key == key {
+            // Free the leaf
+            drop(node.into_leaf_box());
+            return (NodePtr::NULL, true);
+        }
+        return (node, false);
+    }
+
+    // Inner node
+    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+    let plen = prefix.len();
+    if key.len() < depth + plen || key[depth..depth + plen] != prefix[..] {
+        return (node, false);
+    }
+
+    let nd = depth + plen;
+    let mut node = node;
+
+    if nd == key.len() {
+        // Deleting the value stored on this inner node
+        if !inner_has_value(&node) {
+            return (node, false);
+        }
+        inner_clear_value(&mut node);
+        return (compact(node), true);
+    }
+
+    let b = key[nd];
+    let child = inner_find(node, b);
+    if child.is_null() {
+        return (node, false);
+    }
+
+    let (new_child, deleted) = delete_recursive(child, key, nd + 1);
+    if !deleted {
+        return (node, false);
+    }
+
+    if new_child.is_null() {
+        inner_remove_child(&mut node, b);
+    } else {
+        inner_replace_child(&mut node, b, new_child);
+    }
+
+    (compact(node), true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1041,5 +1327,173 @@ mod tests {
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(tree.get(k), Some(&i));
         }
+    }
+
+    // -- delete tests --
+
+    #[test]
+    fn delete_single() {
+        let mut tree = ARTMap::new();
+        tree.put(b"k", 1);
+        assert!(tree.delete(b"k"));
+        assert!(tree.get(b"k").is_none());
+        assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn delete_missing() {
+        let mut tree: ARTMap<i32> = ARTMap::new();
+        assert!(!tree.delete(b"x"));
+    }
+
+    #[test]
+    fn delete_missing_after_real_delete() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.delete(b"a");
+        assert!(!tree.delete(b"a"));
+    }
+
+    #[test]
+    fn delete_one_of_many() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        tree.put(b"c", 3);
+        tree.delete(b"b");
+        assert_eq!(tree.get(b"a"), Some(&1));
+        assert!(tree.get(b"b").is_none());
+        assert_eq!(tree.get(b"c"), Some(&3));
+        assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn delete_prefix_key_middle() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"ab", 2);
+        tree.put(b"abc", 3);
+        tree.delete(b"ab");
+        assert_eq!(tree.get(b"a"), Some(&1));
+        assert!(tree.get(b"ab").is_none());
+        assert_eq!(tree.get(b"abc"), Some(&3));
+        assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn delete_prefix_key_shortest() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"ab", 2);
+        tree.put(b"abc", 3);
+        tree.delete(b"a");
+        assert!(tree.get(b"a").is_none());
+        assert_eq!(tree.get(b"ab"), Some(&2));
+        assert_eq!(tree.get(b"abc"), Some(&3));
+    }
+
+    #[test]
+    fn delete_prefix_key_longest() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"ab", 2);
+        tree.put(b"abc", 3);
+        tree.delete(b"abc");
+        assert_eq!(tree.get(b"a"), Some(&1));
+        assert_eq!(tree.get(b"ab"), Some(&2));
+        assert!(tree.get(b"abc").is_none());
+    }
+
+    #[test]
+    fn delete_returns_false_for_prefix_of_existing() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abc", 1);
+        assert!(!tree.delete(b"ab"));
+        assert!(!tree.delete(b"a"));
+        assert_eq!(tree.get(b"abc"), Some(&1));
+    }
+
+    #[test]
+    fn delete_returns_false_for_extension() {
+        let mut tree = ARTMap::new();
+        tree.put(b"ab", 1);
+        assert!(!tree.delete(b"abc"));
+        assert_eq!(tree.get(b"ab"), Some(&1));
+    }
+
+    #[test]
+    fn reinsert_after_delete() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.delete(b"a");
+        tree.put(b"a", 2);
+        assert_eq!(tree.get(b"a"), Some(&2));
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn delete_all_then_reuse() {
+        let mut tree = ARTMap::new();
+        for i in 0..10u8 {
+            tree.put(&[b'a' + i], i as i32);
+        }
+        for i in 0..10u8 {
+            assert!(tree.delete(&[b'a' + i]));
+        }
+        assert_eq!(tree.len(), 0);
+        tree.put(b"fresh", 1);
+        assert_eq!(tree.get(b"fresh"), Some(&1));
+    }
+
+    #[test]
+    fn shrink_node16_to_node4() {
+        let mut tree = ARTMap::new();
+        for i in 0..5u8 {
+            tree.put(&[b'a' + i], i as i32);
+        }
+        tree.delete(b"e");
+        for i in 0..4u8 {
+            assert_eq!(tree.get(&[b'a' + i]), Some(&(i as i32)));
+        }
+        assert_eq!(tree.len(), 4);
+    }
+
+    #[test]
+    fn shrink_to_single_leaf() {
+        let mut tree = ARTMap::new();
+        for i in 0..5u8 {
+            tree.put(&[b'a' + i], i as i32);
+        }
+        for i in 1..5u8 {
+            tree.delete(&[b'a' + i]);
+        }
+        assert_eq!(tree.get(b"a"), Some(&0));
+        assert_eq!(tree.len(), 1);
+    }
+
+    #[test]
+    fn prefix_recompression_after_delete() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abc", 1);
+        tree.put(b"abd", 2);
+        tree.delete(b"abd");
+        assert_eq!(tree.get(b"abc"), Some(&1));
+        tree.put(b"abc", 99);
+        assert_eq!(tree.get(b"abc"), Some(&99));
+    }
+
+    #[test]
+    fn delete_all_200() {
+        let mut tree = ARTMap::new();
+        let keys: Vec<Vec<u8>> = (0..200).map(|i| format!("k{}", i).into_bytes()).collect();
+        for k in &keys {
+            tree.put(k, 0);
+        }
+        for k in &keys {
+            assert!(tree.delete(k));
+        }
+        assert_eq!(tree.len(), 0);
+        tree.put(b"fresh", 1);
+        assert_eq!(tree.get(b"fresh"), Some(&1));
     }
 }
