@@ -44,8 +44,8 @@ impl<V> NodePtr<V> {
 
     // -- constructors --
 
-    fn from_leaf(leaf: Box<Leaf<V>>) -> Self {
-        let raw = Box::into_raw(leaf) as usize;
+    fn from_leaf(ptr: *mut Leaf<V>) -> Self {
+        let raw = ptr as usize;
         debug_assert!(raw & TAG_MASK == 0, "leaf pointer not aligned");
         NodePtr(raw | TAG_LEAF, std::marker::PhantomData)
     }
@@ -81,9 +81,9 @@ impl<V> NodePtr<V> {
         unsafe { &*((self.0 & !TAG_MASK) as *const Leaf<V>) }
     }
 
-    fn into_leaf_box(self) -> Box<Leaf<V>> {
+    fn leaf_ptr(self) -> *mut Leaf<V> {
         debug_assert!(self.is_leaf());
-        unsafe { Box::from_raw((self.0 & !TAG_MASK) as *mut Leaf<V>) }
+        (self.0 & !TAG_MASK) as *mut Leaf<V>
     }
 
     fn kind(&self) -> usize {
@@ -153,7 +153,7 @@ impl<V> NodePtr<V> {
             return;
         }
         if self.is_leaf() {
-            drop(self.into_leaf_box());
+            drop_leaf(self);
             return;
         }
         match self.kind() {
@@ -196,12 +196,66 @@ impl<V> NodePtr<V> {
 }
 
 // ---------------------------------------------------------------------------
-// Leaf
+// Leaf — key bytes stored inline after the struct (no Vec indirection)
 // ---------------------------------------------------------------------------
 
+#[repr(C)]
 struct Leaf<V> {
-    key: Vec<u8>,
+    key_len: u32,
     value: V,
+    // [u8; key_len] follows immediately in memory
+}
+
+impl<V> Leaf<V> {
+    fn key(&self) -> &[u8] {
+        unsafe {
+            let base = (self as *const Self as *const u8).add(std::mem::size_of::<Self>());
+            std::slice::from_raw_parts(base, self.key_len as usize)
+        }
+    }
+}
+
+fn leaf_layout<V>(key_len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(
+        std::mem::size_of::<Leaf<V>>() + key_len,
+        std::mem::align_of::<Leaf<V>>(),
+    )
+    .unwrap()
+}
+
+/// Allocate a Leaf with inline key bytes, return a tagged NodePtr.
+fn alloc_leaf<V>(key: &[u8], value: V) -> NodePtr<V> {
+    unsafe {
+        let layout = leaf_layout::<V>(key.len());
+        let ptr = std::alloc::alloc(layout) as *mut Leaf<V>;
+        assert!(!ptr.is_null(), "allocation failed");
+        std::ptr::write(&mut (*ptr).key_len, key.len() as u32);
+        std::ptr::write(&mut (*ptr).value, value);
+        let key_dst = (ptr as *mut u8).add(std::mem::size_of::<Leaf<V>>());
+        std::ptr::copy_nonoverlapping(key.as_ptr(), key_dst, key.len());
+        NodePtr::from_leaf(ptr)
+    }
+}
+
+/// Read the value out of a leaf and deallocate it. Returns the value.
+unsafe fn consume_leaf<V>(node: NodePtr<V>) -> V {
+    debug_assert!(node.is_leaf());
+    let ptr = (node.0 & !TAG_MASK) as *mut Leaf<V>;
+    let key_len = (*ptr).key_len as usize;
+    let value = std::ptr::read(&(*ptr).value);
+    let layout = leaf_layout::<V>(key_len);
+    std::alloc::dealloc(ptr as *mut u8, layout);
+    value
+}
+
+/// Deallocate a leaf, dropping the value.
+unsafe fn drop_leaf<V>(node: NodePtr<V>) {
+    debug_assert!(node.is_leaf());
+    let ptr = (node.0 & !TAG_MASK) as *mut Leaf<V>;
+    let key_len = (*ptr).key_len as usize;
+    std::ptr::drop_in_place(&mut (*ptr).value);
+    let layout = leaf_layout::<V>(key_len);
+    std::alloc::dealloc(ptr as *mut u8, layout);
 }
 
 // ---------------------------------------------------------------------------
@@ -363,7 +417,7 @@ impl<V> ARTMap<V> {
         while !node.is_null() {
             if node.is_leaf() {
                 let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-                if leaf.key == key {
+                if leaf.key() == key {
                     return Some(&leaf.value);
                 }
                 return None;
@@ -443,7 +497,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
             let node = self.stack.pop()?;
             if node.is_leaf() {
                 let leaf = unsafe { &*((node.0 & !TAG_MASK) as *const Leaf<V>) };
-                return Some((&leaf.key, &leaf.value));
+                return Some((leaf.key(), &leaf.value));
             }
             // Inner node: push children in reverse byte order (smallest on top)
             push_children_rev(node, &mut self.stack);
@@ -519,7 +573,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
 
             if node.is_leaf() {
                 let leaf = unsafe { &*((node.0 & !TAG_MASK) as *const Leaf<V>) };
-                let kb = &leaf.key[..];
+                let kb = leaf.key();
                 if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
                     return Some((kb, &leaf.value));
                 }
@@ -1133,7 +1187,7 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
             // Free the inner node
             free_inner_node_shell(node);
             let (k, v) = val.unwrap();
-            return NodePtr::from_leaf(Box::new(Leaf { key: k, value: v }));
+            return alloc_leaf(&k, v);
         }
         // Totally empty — free and return null
         free_inner_node_shell(node);
@@ -1220,9 +1274,8 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
     }
 
     if node.is_leaf() {
-        if node.as_leaf().key == key {
-            // Free the leaf
-            drop(node.into_leaf_box());
+        if node.as_leaf().key() == key {
+            unsafe { drop_leaf(node); }
             return (NodePtr::NULL, true);
         }
         return (node, false);
@@ -1275,23 +1328,22 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
 fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool, V) {
     // Empty slot -> new leaf
     if node.is_null() {
-        let leaf = Box::new(Leaf { key: key.to_vec(), value });
-        return (NodePtr::from_leaf(leaf), true, unsafe { std::mem::zeroed() });
+        return (alloc_leaf(key, value), true, unsafe { std::mem::zeroed() });
     }
 
     // Leaf
     if node.is_leaf() {
         let existing = node.as_leaf();
-        if existing.key == key {
-            // Update existing leaf
-            let mut leaf_box = node.into_leaf_box();
-            let old_value = std::mem::replace(&mut leaf_box.value, value);
-            return (NodePtr::from_leaf(leaf_box), false, old_value);
+        if existing.key() == key {
+            // Update existing leaf in place (key unchanged, so allocation stays)
+            let leaf = unsafe { &mut *node.leaf_ptr() };
+            let old_value = std::mem::replace(&mut leaf.value, value);
+            return (node, false, old_value);
         }
 
         // Mismatch: create Node4 to hold both
-        let ekb = &existing.key;
-        let common = prefix_mismatch(key, depth, ekb, depth);
+        let ekb = existing.key().to_vec(); // copy key before we might consume the leaf
+        let common = prefix_mismatch(key, depth, &ekb, depth);
         let sd = depth + common; // split depth
 
         let mut nn = Box::new(Node4::<V>::new());
@@ -1305,17 +1357,13 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
             inner_add_child(&mut nn_ptr, ekb[sd], node);
         } else if sd == ekb.len() {
             // Existing key is prefix of new key
-            let ekb_clone = ekb.to_vec();
-            let existing_box = node.into_leaf_box();
-            inner_set_value(&mut nn_ptr, ekb_clone, existing_box.value);
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
-            inner_add_child(&mut nn_ptr, key[sd], NodePtr::from_leaf(new_leaf));
+            let existing_value = unsafe { consume_leaf(node) };
+            inner_set_value(&mut nn_ptr, ekb.clone(), existing_value);
+            inner_add_child(&mut nn_ptr, key[sd], alloc_leaf(key, value));
         } else {
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
-            // Add in sorted order
             let new_b = key[sd];
             let old_b = ekb[sd];
-            inner_add_child(&mut nn_ptr, new_b, NodePtr::from_leaf(new_leaf));
+            inner_add_child(&mut nn_ptr, new_b, alloc_leaf(key, value));
             inner_add_child(&mut nn_ptr, old_b, node);
         }
         return (nn_ptr, true, unsafe { std::mem::zeroed() });
@@ -1342,8 +1390,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if nd == key.len() {
             inner_set_value(&mut nn_ptr, key.to_vec(), value);
         } else {
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
-            inner_add_child(&mut nn_ptr, key[nd], NodePtr::from_leaf(new_leaf));
+            inner_add_child(&mut nn_ptr, key[nd], alloc_leaf(key, value));
         }
         return (nn_ptr, true, unsafe { std::mem::zeroed() });
     }
@@ -1367,8 +1414,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if inner_is_full(&node) {
             node = grow(node);
         }
-        let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
-        inner_add_child(&mut node, b, NodePtr::from_leaf(new_leaf));
+        inner_add_child(&mut node, b, alloc_leaf(key, value));
         return (node, true, unsafe { std::mem::zeroed() });
     }
 
