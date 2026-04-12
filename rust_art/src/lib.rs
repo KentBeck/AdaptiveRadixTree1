@@ -400,6 +400,14 @@ impl<V> ARTMap<V> {
         unsafe { iter_all(self.root, &mut result) };
         result
     }
+
+    /// Iterate (key, value) pairs in sorted order within [from_key, to_key].
+    /// Pass None for either bound to leave it unconstrained.
+    pub fn range(&self, from_key: Option<&[u8]>, to_key: Option<&[u8]>) -> Vec<(&[u8], &V)> {
+        let mut result = Vec::new();
+        unsafe { iter_range(self.root, 0, from_key, to_key, &mut result) };
+        result
+    }
 }
 
 /// Recursively collect all (key, value) pairs in sorted order.
@@ -418,6 +426,135 @@ unsafe fn iter_all<'a, V>(node: NodePtr<V>, out: &mut Vec<(&'a [u8], &'a V)>) {
     }
     for (_, child) in inner_children(&node) {
         iter_all(child, out);
+    }
+}
+
+/// O(log n + k) range iteration. Tracks boundary paths to prune branches.
+///
+/// At every inner node:
+/// 1. Compares prefix with remaining bound bytes to prune or relax constraints
+/// 2. Uses next bound byte to skip children before lo or after hi
+/// 3. Passes bound only to children on the exact boundary byte
+unsafe fn iter_range<'a, V>(
+    node: NodePtr<V>,
+    depth: usize,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    out: &mut Vec<(&'a [u8], &'a V)>,
+) {
+    if node.is_null() {
+        return;
+    }
+
+    if node.is_leaf() {
+        let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
+        let kb = &leaf.key[..];
+        if let Some(lo) = lo {
+            if kb < lo { return; }
+        }
+        if let Some(hi) = hi {
+            if kb > hi { return; }
+        }
+        out.push((kb, &leaf.value));
+        return;
+    }
+
+    // Inner node
+    let p = inner_prefix_raw(node);
+    let plen = p.len();
+    let nd = depth + plen; // depth after consuming prefix
+
+    // -- lo boundary analysis --
+    let mut lo = lo;
+    let mut lo_on = false;
+    if let Some(lo_bytes) = lo {
+        let lo_avail = if lo_bytes.len() > depth { lo_bytes.len() - depth } else { 0 };
+        if lo_avail == 0 {
+            lo = None; // lo already consumed, everything here >= lo
+        } else if plen == 0 {
+            lo_on = true; // decide at child level
+        } else {
+            let cn = plen.min(lo_avail);
+            let pp = &p[..cn];
+            let lp = &lo_bytes[depth..depth + cn];
+            if pp < lp {
+                return; // whole subtree < lo
+            }
+            if pp > lp {
+                lo = None; // past lo, no lower constraint
+            } else if cn < plen {
+                lo = None; // lo exhausted inside prefix
+            } else if lo_avail > plen {
+                lo_on = true; // lo has more bytes, check children
+            } else {
+                lo = None; // lo exhausted exactly at nd
+            }
+        }
+    }
+
+    // -- hi boundary analysis --
+    let mut hi = hi;
+    let mut hi_on = false;
+    if let Some(hi_bytes) = hi {
+        let hi_avail = if hi_bytes.len() > depth { hi_bytes.len() - depth } else { 0 };
+        if hi_avail == 0 {
+            // hi exhausted: only this node's own value could match
+            if let Some((k, v)) = inner_value_raw(node) {
+                let kb = k.as_slice();
+                if (lo.is_none() || kb >= lo.unwrap()) && kb <= hi_bytes {
+                    out.push((kb, v));
+                }
+            }
+            return;
+        } else if plen == 0 {
+            hi_on = true;
+        } else {
+            let cn = plen.min(hi_avail);
+            let pp = &p[..cn];
+            let hp = &hi_bytes[depth..depth + cn];
+            if pp > hp {
+                return; // whole subtree > hi
+            }
+            if pp < hp {
+                hi = None; // before hi, no upper constraint
+            } else if cn < plen {
+                return; // hi exhausted inside prefix, keys > hi
+            } else if hi_avail > plen {
+                hi_on = true;
+            } else {
+                // hi exhausted at nd; own value may equal hi, children > hi
+                if let Some((k, v)) = inner_value_raw(node) {
+                    let kb = k.as_slice();
+                    if (lo.is_none() || kb >= lo.unwrap()) && kb <= hi_bytes {
+                        out.push((kb, v));
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    // -- yield own value --
+    if let Some((k, v)) = inner_value_raw(node) {
+        let kb = k.as_slice();
+        let lo_ok = lo.is_none() || kb >= lo.unwrap();
+        let hi_ok = hi.is_none() || kb <= hi.unwrap();
+        if lo_ok && hi_ok {
+            out.push((kb, v));
+        }
+    }
+
+    // -- visit children with byte-level pruning --
+    let lo_byte: i16 = if lo_on { lo.unwrap()[nd] as i16 } else { -1 };
+    let hi_byte: i16 = if hi_on { hi.unwrap()[nd] as i16 } else { 256 };
+
+    for (byte, child) in inner_children(&node) {
+        let b = byte as i16;
+        if b < lo_byte { continue; }
+        if b > hi_byte { return; }
+        let child_lo = if lo_on && b == lo_byte { lo } else { None };
+        let child_hi = if hi_on && b == hi_byte { hi } else { None };
+        iter_range(child, nd + 1, child_lo, child_hi, out);
     }
 }
 
@@ -1596,5 +1733,215 @@ mod tests {
         let result: Vec<Vec<u8>> = tree.items().into_iter().map(|(k, _)| k.to_vec()).collect();
         keys.sort();
         assert_eq!(result, keys);
+    }
+
+    // -- range scan tests --
+
+    fn keys_from_range(tree: &ARTMap<i32>, from: Option<&[u8]>, to: Option<&[u8]>) -> Vec<Vec<u8>> {
+        tree.range(from, to).into_iter().map(|(k, _)| k.to_vec()).collect()
+    }
+
+    #[test]
+    fn range_from_key() {
+        let mut tree = ARTMap::new();
+        for c in b"abcde" {
+            tree.put(&[*c], *c as i32);
+        }
+        assert_eq!(keys_from_range(&tree, Some(b"c"), None),
+            vec![b"c".to_vec(), b"d".to_vec(), b"e".to_vec()]);
+    }
+
+    #[test]
+    fn range_to_key() {
+        let mut tree = ARTMap::new();
+        for c in b"abcde" {
+            tree.put(&[*c], *c as i32);
+        }
+        assert_eq!(keys_from_range(&tree, None, Some(b"c")),
+            vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+    }
+
+    #[test]
+    fn range_from_and_to() {
+        let mut tree = ARTMap::new();
+        for c in b"abcde" {
+            tree.put(&[*c], *c as i32);
+        }
+        assert_eq!(keys_from_range(&tree, Some(b"b"), Some(b"d")),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]);
+    }
+
+    #[test]
+    fn range_empty_result() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"z", 26);
+        assert!(keys_from_range(&tree, Some(b"m"), Some(b"n")).is_empty());
+    }
+
+    #[test]
+    fn range_from_beyond_all() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        assert!(keys_from_range(&tree, Some(b"z"), None).is_empty());
+    }
+
+    #[test]
+    fn range_to_before_all() {
+        let mut tree = ARTMap::new();
+        tree.put(b"m", 1);
+        tree.put(b"n", 2);
+        assert!(keys_from_range(&tree, None, Some(b"a")).is_empty());
+    }
+
+    #[test]
+    fn range_exact_bounds() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        tree.put(b"c", 3);
+        let r = tree.range(Some(b"b"), Some(b"b"));
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].0, b"b");
+    }
+
+    #[test]
+    fn range_exact_bounds_missing() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"c", 3);
+        assert!(tree.range(Some(b"b"), Some(b"b")).is_empty());
+    }
+
+    #[test]
+    fn range_with_shared_prefix() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abc", 1);
+        tree.put(b"abd", 2);
+        tree.put(b"abe", 3);
+        tree.put(b"abf", 4);
+        let items = tree.range(Some(b"abd"), Some(b"abe"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, b"abd");
+        assert_eq!(items[1].0, b"abe");
+    }
+
+    #[test]
+    fn range_prefix_keys() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"ab", 2);
+        tree.put(b"abc", 3);
+        tree.put(b"abd", 4);
+        tree.put(b"b", 5);
+        let items = tree.range(Some(b"ab"), Some(b"abd"));
+        let keys: Vec<_> = items.into_iter().map(|(k, _)| k.to_vec()).collect();
+        assert_eq!(keys, vec![b"ab".to_vec(), b"abc".to_vec(), b"abd".to_vec()]);
+    }
+
+    #[test]
+    fn range_from_is_prefix_of_keys() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abc", 1);
+        tree.put(b"abd", 2);
+        tree.put(b"xyz", 3);
+        let keys = keys_from_range(&tree, Some(b"ab"), None);
+        assert_eq!(keys, vec![b"abc".to_vec(), b"abd".to_vec(), b"xyz".to_vec()]);
+    }
+
+    #[test]
+    fn range_to_is_prefix_of_keys() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"abc", 2);
+        tree.put(b"abd", 3);
+        tree.put(b"b", 4);
+        let keys = keys_from_range(&tree, None, Some(b"ab"));
+        assert_eq!(keys, vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn range_with_empty_from_key() {
+        let mut tree = ARTMap::new();
+        tree.put(b"", 0);
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        let keys = keys_from_range(&tree, Some(b""), None);
+        assert_eq!(keys, vec![b"".to_vec(), b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    #[test]
+    fn range_with_empty_to_key() {
+        let mut tree = ARTMap::new();
+        tree.put(b"", 0);
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        let keys = keys_from_range(&tree, None, Some(b""));
+        assert_eq!(keys, vec![b"".to_vec()]);
+    }
+
+    #[test]
+    fn range_stress_500() {
+        let mut tree = ARTMap::new();
+        let keys: Vec<Vec<u8>> = (0..500)
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        for k in &keys {
+            tree.put(k, 0);
+        }
+        for &(lo, hi) in &[(50, 100), (0, 10), (490, 499), (200, 200)] {
+            let lo_key = format!("k{:04}", lo).into_bytes();
+            let hi_key = format!("k{:04}", hi).into_bytes();
+            let result = keys_from_range(&tree, Some(&lo_key), Some(&hi_key));
+            let expected: Vec<Vec<u8>> = (lo..=hi)
+                .map(|i| format!("k{:04}", i).into_bytes())
+                .collect();
+            assert_eq!(result, expected, "range [{}, {}]", lo, hi);
+        }
+    }
+
+    #[test]
+    fn range_no_overlap() {
+        let mut tree = ARTMap::new();
+        tree.put(b"aaa", 1);
+        tree.put(b"bbb", 2);
+        tree.put(b"ccc", 3);
+        assert!(tree.range(Some(b"d"), Some(b"z")).is_empty());
+        assert!(tree.range(Some(b"0"), Some(b"1")).is_empty());
+    }
+
+    #[test]
+    fn range_deep_tree() {
+        let base = "a".repeat(50);
+        let mut tree = ARTMap::new();
+        let keys: Vec<Vec<u8>> = (0..10)
+            .map(|i| format!("{}{}", base, (b'a' + i) as char).into_bytes())
+            .collect();
+        for k in &keys {
+            tree.put(k, 0);
+        }
+        let result = keys_from_range(&tree, Some(&keys[3]), Some(&keys[7]));
+        assert_eq!(result, keys[3..8].to_vec());
+    }
+
+    #[test]
+    fn range_matches_full_scan() {
+        // Verify range scan matches naive filter of full scan
+        let mut tree = ARTMap::new();
+        let keys: Vec<Vec<u8>> = (0..200)
+            .map(|i| format!("k{:04}", i).into_bytes())
+            .collect();
+        for k in &keys {
+            tree.put(k, 0);
+        }
+        let lo = b"k0050".to_vec();
+        let hi = b"k0150".to_vec();
+        let range_result = keys_from_range(&tree, Some(&lo), Some(&hi));
+        let full_result: Vec<Vec<u8>> = tree.items().into_iter()
+            .filter(|(k, _)| k >= &lo.as_slice() && k <= &hi.as_slice())
+            .map(|(k, _)| k.to_vec())
+            .collect();
+        assert_eq!(range_result, full_result);
     }
 }
