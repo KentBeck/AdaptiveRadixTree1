@@ -170,7 +170,8 @@ fn bench_iterate_all(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("ART", n), &n, |b, _| {
             b.iter(|| {
                 let mut count = 0usize;
-                for _ in tree.items() {
+                for entry in tree.iter() {
+                    std::hint::black_box(entry);
                     count += 1;
                 }
                 count
@@ -180,7 +181,8 @@ fn bench_iterate_all(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("BTreeMap", n), &n, |b, _| {
             b.iter(|| {
                 let mut count = 0usize;
-                for _ in map.iter() {
+                for entry in map.iter() {
+                    std::hint::black_box(entry);
                     count += 1;
                 }
                 count
@@ -211,8 +213,12 @@ fn bench_range_query(c: &mut Criterion) {
 
         group.bench_with_input(BenchmarkId::new("ART", n), &n, |b, _| {
             b.iter(|| {
-                let items = tree.range(Some(&lo_key), Some(&hi_key));
-                std::hint::black_box(items.len())
+                let mut count = 0usize;
+                for entry in tree.range_iter(Some(&lo_key), Some(&hi_key)) {
+                    std::hint::black_box(entry);
+                    count += 1;
+                }
+                count
             });
         });
 

@@ -146,8 +146,11 @@ fn run(n: usize) {
     // -- iterate all --
     let t_art = {
         let t = Instant::now();
-        let items = art.items();
-        let count = items.len();
+        let mut count = 0usize;
+        for entry in art.iter() {
+            std::hint::black_box(entry);
+            count += 1;
+        }
         std::hint::black_box(count);
         t.elapsed().as_secs_f64()
     };
@@ -172,8 +175,12 @@ fn run(n: usize) {
 
     let t_art = {
         let t = Instant::now();
-        let items = art.range(Some(&lo_key), Some(&hi_key));
-        assert_eq!(items.len(), expected);
+        let mut count = 0usize;
+        for entry in art.range_iter(Some(&lo_key), Some(&hi_key)) {
+            std::hint::black_box(entry);
+            count += 1;
+        }
+        assert_eq!(count, expected);
         t.elapsed().as_secs_f64()
     };
     let t_bt = {

@@ -389,167 +389,277 @@ impl<V> ARTMap<V> {
         None
     }
 
-    /// Iterate all (key, value) pairs in sorted key order.
+    /// Iterate all (key, value) pairs in sorted key order (collects into Vec).
     pub fn items(&self) -> Vec<(&[u8], &V)> {
-        let mut result = Vec::new();
-        unsafe { iter_all(self.root, &mut result) };
-        result
+        self.iter().collect()
     }
 
-    /// Iterate (key, value) pairs in sorted order within [from_key, to_key].
-    /// Pass None for either bound to leave it unconstrained.
-    pub fn range(&self, from_key: Option<&[u8]>, to_key: Option<&[u8]>) -> Vec<(&[u8], &V)> {
-        let mut result = Vec::new();
-        unsafe { iter_range(self.root, 0, from_key, to_key, &mut result) };
-        result
+    /// Iterate (key, value) pairs in [from_key, to_key] (collects into Vec).
+    pub fn range<'a>(
+        &'a self,
+        from_key: Option<&'a [u8]>,
+        to_key: Option<&'a [u8]>,
+    ) -> Vec<(&'a [u8], &'a V)> {
+        self.range_iter(from_key, to_key).collect()
+    }
+
+    /// Lazy iterator over all (key, value) pairs in sorted order.
+    pub fn iter(&self) -> Iter<'_, V> {
+        let mut stack = Vec::new();
+        if !self.root.is_null() {
+            stack.push(self.root);
+        }
+        Iter { stack, _marker: std::marker::PhantomData }
+    }
+
+    /// Lazy iterator over (key, value) pairs in [lo, hi] with O(log n + k) pruning.
+    pub fn range_iter<'a>(
+        &'a self,
+        lo: Option<&'a [u8]>,
+        hi: Option<&'a [u8]>,
+    ) -> RangeIter<'a, V> {
+        let mut stack = Vec::new();
+        if !self.root.is_null() {
+            stack.push(RangeFrame { node: self.root, depth: 0, lo, hi });
+        }
+        RangeIter { stack, _marker: std::marker::PhantomData }
     }
 }
 
-/// Recursively collect all (key, value) pairs in sorted order.
-unsafe fn iter_all<'a, V>(node: NodePtr<V>, out: &mut Vec<(&'a [u8], &'a V)>) {
-    if node.is_null() {
-        return;
-    }
-    if node.is_leaf() {
-        let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-        out.push((&leaf.key, &leaf.value));
-        return;
-    }
-    // Inner node: own value first (shorter key sorts before children)
-    if let Some((k, v)) = inner_value_raw(node) {
-        out.push((k.as_slice(), v));
-    }
-    for (_, child) in inner_children(&node) {
-        iter_all(child, out);
+// ---------------------------------------------------------------------------
+// Lazy iterator (full scan)
+// ---------------------------------------------------------------------------
+
+pub struct Iter<'a, V> {
+    stack: Vec<NodePtr<V>>,
+    _marker: std::marker::PhantomData<&'a V>,
+}
+
+impl<'a, V> Iterator for Iter<'a, V> {
+    type Item = (&'a [u8], &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let node = self.stack.pop()?;
+            if node.is_leaf() {
+                let leaf = unsafe { &*((node.0 & !TAG_MASK) as *const Leaf<V>) };
+                return Some((&leaf.key, &leaf.value));
+            }
+            // Inner node: push children in reverse byte order (smallest on top)
+            push_children_rev(node, &mut self.stack);
+            // Yield own value if present
+            if let Some((k, v)) = unsafe { inner_value_raw(node) } {
+                return Some((k.as_slice(), v));
+            }
+        }
     }
 }
 
-/// O(log n + k) range iteration. Tracks boundary paths to prune branches.
-///
-/// At every inner node:
-/// 1. Compares prefix with remaining bound bytes to prune or relax constraints
-/// 2. Uses next bound byte to skip children before lo or after hi
-/// 3. Passes bound only to children on the exact boundary byte
-unsafe fn iter_range<'a, V>(
+/// Push children of an inner node in reverse sorted order onto the stack.
+fn push_children_rev<V>(node: NodePtr<V>, stack: &mut Vec<NodePtr<V>>) {
+    match node.kind() {
+        KIND_NODE4 => {
+            let n = node.as_node4();
+            for i in (0..n.count as usize).rev() {
+                stack.push(n.children[i]);
+            }
+        }
+        KIND_NODE16 => {
+            let n = node.as_node16();
+            for i in (0..n.count as usize).rev() {
+                stack.push(n.children[i]);
+            }
+        }
+        KIND_NODE48 => {
+            let n = node.as_node48();
+            for b in (0..256usize).rev() {
+                if n.index[b] != 0xFF {
+                    stack.push(n.slots[n.index[b] as usize]);
+                }
+            }
+        }
+        KIND_NODE256 => {
+            let n = node.as_node256();
+            for b in (0..256usize).rev() {
+                if !n.children[b].is_null() {
+                    stack.push(n.children[b]);
+                }
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lazy range iterator with O(log n + k) boundary pruning
+// ---------------------------------------------------------------------------
+
+struct RangeFrame<'a, V> {
     node: NodePtr<V>,
     depth: usize,
-    lo: Option<&[u8]>,
-    hi: Option<&[u8]>,
-    out: &mut Vec<(&'a [u8], &'a V)>,
-) {
-    if node.is_null() {
-        return;
-    }
+    lo: Option<&'a [u8]>,
+    hi: Option<&'a [u8]>,
+}
 
-    if node.is_leaf() {
-        let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-        let kb = &leaf.key[..];
-        if let Some(lo) = lo {
-            if kb < lo { return; }
-        }
-        if let Some(hi) = hi {
-            if kb > hi { return; }
-        }
-        out.push((kb, &leaf.value));
-        return;
-    }
+pub struct RangeIter<'a, V> {
+    stack: Vec<RangeFrame<'a, V>>,
+    _marker: std::marker::PhantomData<&'a V>,
+}
 
-    // Inner node
-    let p = inner_prefix_raw(node);
-    let plen = p.len();
-    let nd = depth + plen; // depth after consuming prefix
+impl<'a, V> Iterator for RangeIter<'a, V> {
+    type Item = (&'a [u8], &'a V);
 
-    // -- lo boundary analysis --
-    let mut lo = lo;
-    let mut lo_on = false;
-    if let Some(lo_bytes) = lo {
-        let lo_avail = if lo_bytes.len() > depth { lo_bytes.len() - depth } else { 0 };
-        if lo_avail == 0 {
-            lo = None; // lo already consumed, everything here >= lo
-        } else if plen == 0 {
-            lo_on = true; // decide at child level
-        } else {
-            let cn = plen.min(lo_avail);
-            let pp = &p[..cn];
-            let lp = &lo_bytes[depth..depth + cn];
-            if pp < lp {
-                return; // whole subtree < lo
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let frame = self.stack.pop()?;
+            let node = frame.node;
+            let depth = frame.depth;
+            let lo = frame.lo;
+            let hi = frame.hi;
+
+            if node.is_leaf() {
+                let leaf = unsafe { &*((node.0 & !TAG_MASK) as *const Leaf<V>) };
+                let kb = &leaf.key[..];
+                if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
+                    return Some((kb, &leaf.value));
+                }
+                continue;
             }
-            if pp > lp {
-                lo = None; // past lo, no lower constraint
-            } else if cn < plen {
-                lo = None; // lo exhausted inside prefix
-            } else if lo_avail > plen {
-                lo_on = true; // lo has more bytes, check children
-            } else {
-                lo = None; // lo exhausted exactly at nd
-            }
-        }
-    }
 
-    // -- hi boundary analysis --
-    let mut hi = hi;
-    let mut hi_on = false;
-    if let Some(hi_bytes) = hi {
-        let hi_avail = if hi_bytes.len() > depth { hi_bytes.len() - depth } else { 0 };
-        if hi_avail == 0 {
-            // hi exhausted: only this node's own value could match
-            if let Some((k, v)) = inner_value_raw(node) {
-                let kb = k.as_slice();
-                if (lo.is_none() || kb >= lo.unwrap()) && kb <= hi_bytes {
-                    out.push((kb, v));
+            // Inner node — boundary analysis
+            let p = unsafe { inner_prefix_raw(node) };
+            let plen = p.len();
+            let nd = depth + plen;
+
+            // lo boundary
+            let mut lo = lo;
+            let mut lo_on = false;
+            if let Some(lo_bytes) = lo {
+                let lo_avail = lo_bytes.len().saturating_sub(depth);
+                if lo_avail == 0 {
+                    lo = None;
+                } else if plen == 0 {
+                    lo_on = true;
+                } else {
+                    let cn = plen.min(lo_avail);
+                    let pp = &p[..cn];
+                    let lp = &lo_bytes[depth..depth + cn];
+                    if pp < lp { continue; }       // subtree < lo
+                    if pp > lp { lo = None; }
+                    else if cn < plen { lo = None; }
+                    else if lo_avail > plen { lo_on = true; }
+                    else { lo = None; }
                 }
             }
-            return;
-        } else if plen == 0 {
-            hi_on = true;
-        } else {
-            let cn = plen.min(hi_avail);
-            let pp = &p[..cn];
-            let hp = &hi_bytes[depth..depth + cn];
-            if pp > hp {
-                return; // whole subtree > hi
-            }
-            if pp < hp {
-                hi = None; // before hi, no upper constraint
-            } else if cn < plen {
-                return; // hi exhausted inside prefix, keys > hi
-            } else if hi_avail > plen {
-                hi_on = true;
-            } else {
-                // hi exhausted at nd; own value may equal hi, children > hi
-                if let Some((k, v)) = inner_value_raw(node) {
-                    let kb = k.as_slice();
-                    if (lo.is_none() || kb >= lo.unwrap()) && kb <= hi_bytes {
-                        out.push((kb, v));
+
+            // hi boundary
+            let mut hi = hi;
+            let mut hi_on = false;
+            if let Some(hi_bytes) = hi {
+                let hi_avail = hi_bytes.len().saturating_sub(depth);
+                if hi_avail == 0 {
+                    // hi exhausted: only own value could match
+                    if let Some((k, v)) = unsafe { inner_value_raw(node) } {
+                        let kb = k.as_slice();
+                        if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
+                            return Some((kb, v));
+                        }
+                    }
+                    continue;
+                } else if plen == 0 {
+                    hi_on = true;
+                } else {
+                    let cn = plen.min(hi_avail);
+                    let pp = &p[..cn];
+                    let hp = &hi_bytes[depth..depth + cn];
+                    if pp > hp { continue; }       // subtree > hi
+                    if pp < hp { hi = None; }
+                    else if cn < plen { continue; } // hi exhausted inside prefix
+                    else if hi_avail > plen { hi_on = true; }
+                    else {
+                        // hi exhausted at nd; own value may match, children > hi
+                        if let Some((k, v)) = unsafe { inner_value_raw(node) } {
+                            let kb = k.as_slice();
+                            if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
+                                return Some((kb, v));
+                            }
+                        }
+                        continue;
                     }
                 }
-                return;
+            }
+
+            // Push children in range, in reverse byte order
+            let lo_byte: i16 = if lo_on { lo.unwrap()[nd] as i16 } else { -1 };
+            let hi_byte: i16 = if hi_on { hi.unwrap()[nd] as i16 } else { 256 };
+
+            push_range_children_rev(
+                node, nd + 1, lo_byte, hi_byte,
+                lo_on, lo, hi_on, hi, &mut self.stack,
+            );
+
+            // Yield own value if in range
+            if let Some((k, v)) = unsafe { inner_value_raw(node) } {
+                let kb = k.as_slice();
+                if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
+                    return Some((kb, v));
+                }
             }
         }
     }
+}
 
-    // -- yield own value --
-    if let Some((k, v)) = inner_value_raw(node) {
-        let kb = k.as_slice();
-        let lo_ok = lo.is_none() || kb >= lo.unwrap();
-        let hi_ok = hi.is_none() || kb <= hi.unwrap();
-        if lo_ok && hi_ok {
-            out.push((kb, v));
-        }
-    }
-
-    // -- visit children with byte-level pruning --
-    let lo_byte: i16 = if lo_on { lo.unwrap()[nd] as i16 } else { -1 };
-    let hi_byte: i16 = if hi_on { hi.unwrap()[nd] as i16 } else { 256 };
-
-    for (byte, child) in inner_children(&node) {
+/// Push in-range children in reverse byte order onto the range stack.
+fn push_range_children_rev<'a, V>(
+    node: NodePtr<V>,
+    child_depth: usize,
+    lo_byte: i16,
+    hi_byte: i16,
+    lo_on: bool,
+    lo: Option<&'a [u8]>,
+    hi_on: bool,
+    hi: Option<&'a [u8]>,
+    stack: &mut Vec<RangeFrame<'a, V>>,
+) {
+    // Closure to compute per-child bounds and push
+    let mut push = |byte: u8, child: NodePtr<V>| {
         let b = byte as i16;
-        if b < lo_byte { continue; }
-        if b > hi_byte { return; }
+        if b < lo_byte || b > hi_byte { return; }
         let child_lo = if lo_on && b == lo_byte { lo } else { None };
         let child_hi = if hi_on && b == hi_byte { hi } else { None };
-        iter_range(child, nd + 1, child_lo, child_hi, out);
+        stack.push(RangeFrame { node: child, depth: child_depth, lo: child_lo, hi: child_hi });
+    };
+
+    match node.kind() {
+        KIND_NODE4 => {
+            let n = node.as_node4();
+            for i in (0..n.count as usize).rev() {
+                push(n.keys[i], n.children[i]);
+            }
+        }
+        KIND_NODE16 => {
+            let n = node.as_node16();
+            for i in (0..n.count as usize).rev() {
+                push(n.keys[i], n.children[i]);
+            }
+        }
+        KIND_NODE48 => {
+            let n = node.as_node48();
+            for b in (0..256usize).rev() {
+                if n.index[b] != 0xFF {
+                    push(b as u8, n.slots[n.index[b] as usize]);
+                }
+            }
+        }
+        KIND_NODE256 => {
+            let n = node.as_node256();
+            for b in (0..256usize).rev() {
+                if !n.children[b].is_null() {
+                    push(b as u8, n.children[b]);
+                }
+            }
+        }
+        _ => unreachable!(),
     }
 }
 
