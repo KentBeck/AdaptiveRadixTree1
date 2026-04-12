@@ -874,4 +874,109 @@ mod tests {
         assert!(tree.get(b"b").is_none());
         assert!(tree.get(b"ab").is_none());
     }
+
+    #[test]
+    fn multiple_independent_keys() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"b", 2);
+        tree.put(b"c", 3);
+        assert_eq!(tree.get(b"a"), Some(&1));
+        assert_eq!(tree.get(b"b"), Some(&2));
+        assert_eq!(tree.get(b"c"), Some(&3));
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn shared_prefix() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abc", 1);
+        tree.put(b"abd", 2);
+        tree.put(b"xyz", 3);
+        assert_eq!(tree.get(b"abc"), Some(&1));
+        assert_eq!(tree.get(b"abd"), Some(&2));
+        assert_eq!(tree.get(b"xyz"), Some(&3));
+    }
+
+    #[test]
+    fn prefix_key_short_then_long() {
+        let mut tree = ARTMap::new();
+        tree.put(b"ab", 1);
+        tree.put(b"abc", 2);
+        assert_eq!(tree.get(b"ab"), Some(&1));
+        assert_eq!(tree.get(b"abc"), Some(&2));
+        assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn prefix_key_long_then_short() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abc", 2);
+        tree.put(b"ab", 1);
+        assert_eq!(tree.get(b"ab"), Some(&1));
+        assert_eq!(tree.get(b"abc"), Some(&2));
+        assert_eq!(tree.len(), 2);
+    }
+
+    #[test]
+    fn three_level_prefix_chain() {
+        let mut tree = ARTMap::new();
+        tree.put(b"a", 1);
+        tree.put(b"ab", 2);
+        tree.put(b"abc", 3);
+        assert_eq!(tree.get(b"a"), Some(&1));
+        assert_eq!(tree.get(b"ab"), Some(&2));
+        assert_eq!(tree.get(b"abc"), Some(&3));
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn empty_key() {
+        let mut tree = ARTMap::new();
+        tree.put(b"", 0);
+        tree.put(b"a", 1);
+        assert_eq!(tree.get(b""), Some(&0));
+        assert_eq!(tree.get(b"a"), Some(&1));
+    }
+
+    #[test]
+    fn deep_shared_prefix() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abcdefghij", 1);
+        tree.put(b"abcdefghik", 2);
+        assert_eq!(tree.get(b"abcdefghij"), Some(&1));
+        assert_eq!(tree.get(b"abcdefghik"), Some(&2));
+    }
+
+    #[test]
+    fn prefix_split_later_insert() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abcdef", 1);
+        tree.put(b"abcxyz", 2);
+        tree.put(b"abZZZ", 3);
+        assert_eq!(tree.get(b"abcdef"), Some(&1));
+        assert_eq!(tree.get(b"abcxyz"), Some(&2));
+        assert_eq!(tree.get(b"abZZZ"), Some(&3));
+    }
+
+    #[test]
+    fn no_false_match_on_partial_prefix() {
+        let mut tree = ARTMap::new();
+        tree.put(b"abcdef", 1);
+        assert!(tree.get(b"abcXXX").is_none());
+        assert!(tree.get(b"abc").is_none());
+        assert!(tree.get(b"abcdefg").is_none());
+    }
+
+    #[test]
+    fn four_children_in_node4() {
+        let mut tree = ARTMap::new();
+        for i in 0..4u8 {
+            tree.put(&[b'a' + i], i as i32);
+        }
+        for i in 0..4u8 {
+            assert_eq!(tree.get(&[b'a' + i]), Some(&(i as i32)));
+        }
+        assert_eq!(tree.len(), 4);
+    }
 }
