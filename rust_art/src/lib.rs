@@ -1926,6 +1926,36 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_insert_delete() {
+        use std::collections::HashMap;
+        let mut tree = ARTMap::new();
+        let mut live: HashMap<Vec<u8>, i32> = HashMap::new();
+        // Simple LCG PRNG for determinism
+        let mut rng: u64 = 99;
+        let mut next = || -> u64 { rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); rng >> 33 };
+        for _ in 0..2000 {
+            let k = format!("k{}", next() % 201).into_bytes();
+            if next() % 10 < 7 {
+                let v = (next() % 100000) as i32;
+                tree.put(&k, v);
+                live.insert(k, v);
+            } else {
+                let existed = live.remove(&k).is_some();
+                assert_eq!(tree.delete(&k), existed);
+            }
+        }
+        assert_eq!(tree.len(), live.len());
+        for (k, v) in &live {
+            assert_eq!(tree.get(k), Some(v));
+        }
+        let items = tree.items();
+        let mut expected: Vec<_> = live.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        expected.sort();
+        let actual: Vec<_> = items.into_iter().map(|(k, &v)| (k.to_vec(), v)).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn range_matches_full_scan() {
         // Verify range scan matches naive filter of full scan
         let mut tree = ARTMap::new();
