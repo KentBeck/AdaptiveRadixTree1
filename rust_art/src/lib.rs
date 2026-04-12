@@ -979,4 +979,67 @@ mod tests {
         }
         assert_eq!(tree.len(), 4);
     }
+
+    #[test]
+    fn node4_to_node16() {
+        let mut tree = ARTMap::new();
+        for i in 0..5u8 {
+            tree.put(&[b'a' + i], i as i32);
+        }
+        for i in 0..5u8 {
+            assert_eq!(tree.get(&[b'a' + i]), Some(&(i as i32)));
+        }
+        assert_eq!(tree.len(), 5);
+    }
+
+    #[test]
+    fn node16_to_node48() {
+        let mut tree = ARTMap::new();
+        for i in 0..17u8 {
+            tree.put(&[b'a' + i], i as i32);
+        }
+        for i in 0..17u8 {
+            assert_eq!(tree.get(&[b'a' + i]), Some(&(i as i32)));
+        }
+        assert_eq!(tree.len(), 17);
+    }
+
+    #[test]
+    fn node48_to_node256() {
+        let mut tree = ARTMap::new();
+        for i in 0..49u8 {
+            tree.put(&[b'A' + i], i as i32);
+        }
+        for i in 0..49u8 {
+            assert_eq!(tree.get(&[b'A' + i]), Some(&(i as i32)));
+        }
+        assert_eq!(tree.len(), 49);
+    }
+
+    #[test]
+    fn full_byte_range() {
+        let mut tree = ARTMap::new();
+        for b in 0..=255u8 {
+            tree.put(&[b], b as i32);
+        }
+        assert_eq!(tree.len(), 256);
+        for b in 0..=255u8 {
+            assert_eq!(tree.get(&[b]), Some(&(b as i32)));
+        }
+    }
+
+    #[test]
+    fn stress_1000_sequential() {
+        let mut tree = ARTMap::new();
+        let keys: Vec<Vec<u8>> = (0..1000)
+            .map(|i| format!("key{:04}", i).into_bytes())
+            .collect();
+        for (i, k) in keys.iter().enumerate() {
+            tree.put(k, i);
+        }
+        assert_eq!(tree.len(), 1000);
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(tree.get(k), Some(&i));
+        }
+    }
 }
