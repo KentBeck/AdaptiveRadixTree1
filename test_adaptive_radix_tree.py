@@ -513,3 +513,93 @@ class TestEdgeCases:
         assert t.get("helloB") == 2
         assert t.get("helloC") == 3
         assert list(t.items()) == [("helloA", 1), ("helloB", 2), ("helloC", 3)]
+
+
+# ── range scan edge cases (optimized _iter_range path) ────────────────────
+
+class TestRangeScan:
+    def test_from_only(self):
+        t = tree_from(*[(f"k{i:03d}", i) for i in range(100)])
+        result = [k for k, _ in t.items(from_key="k090")]
+        assert result == [f"k{i:03d}" for i in range(90, 100)]
+
+    def test_to_only(self):
+        t = tree_from(*[(f"k{i:03d}", i) for i in range(100)])
+        result = [k for k, _ in t.items(to_key="k009")]
+        assert result == [f"k{i:03d}" for i in range(10)]
+
+    def test_from_equals_to(self):
+        t = tree_from(*[(c, c) for c in "abcde"])
+        assert list(t.items(from_key="c", to_key="c")) == [("c", "c")]
+
+    def test_from_equals_to_missing(self):
+        t = tree_from(("a", 1), ("c", 3))
+        assert list(t.items(from_key="b", to_key="b")) == []
+
+    def test_range_with_shared_prefix(self):
+        t = tree_from(("abc", 1), ("abd", 2), ("abe", 3), ("abf", 4))
+        assert list(t.items(from_key="abd", to_key="abe")) == [("abd", 2), ("abe", 3)]
+
+    def test_range_prefix_keys(self):
+        """Range scan over keys where some are prefixes of others."""
+        t = tree_from(("a", 1), ("ab", 2), ("abc", 3), ("abd", 4), ("b", 5))
+        assert list(t.items(from_key="ab", to_key="abd")) == [
+            ("ab", 2), ("abc", 3), ("abd", 4)
+        ]
+
+    def test_range_from_is_prefix_of_keys(self):
+        t = tree_from(("abc", 1), ("abd", 2), ("xyz", 3))
+        assert [k for k, _ in t.items(from_key="ab")] == ["abc", "abd", "xyz"]
+
+    def test_range_to_is_prefix_of_keys(self):
+        t = tree_from(("a", 1), ("abc", 2), ("abd", 3), ("b", 4))
+        assert list(t.items(to_key="ab")) == [("a", 1)]
+
+    def test_range_with_empty_from_key(self):
+        t = tree_from(("", 0), ("a", 1), ("b", 2))
+        assert list(t.items(from_key="")) == [("", 0), ("a", 1), ("b", 2)]
+
+    def test_range_with_empty_to_key(self):
+        t = tree_from(("", 0), ("a", 1), ("b", 2))
+        assert list(t.items(to_key="")) == [("", 0)]
+
+    def test_range_all_same_prefix(self):
+        keys = [f"prefix{chr(ord('a') + i)}" for i in range(26)]
+        t = AdaptiveRadixTree()
+        for k in keys:
+            t.put(k, k)
+        result = [k for k, _ in t.items(from_key="prefixm", to_key="prefixp")]
+        assert result == ["prefixm", "prefixn", "prefixo", "prefixp"]
+
+    def test_range_deep_tree(self):
+        """Range query on deeply nested keys (long shared prefixes)."""
+        base = "a" * 50
+        keys = sorted(base + chr(ord("a") + i) for i in range(10))
+        t = AdaptiveRadixTree()
+        for k in keys:
+            t.put(k, k)
+        result = [k for k, _ in t.items(from_key=keys[3], to_key=keys[7])]
+        assert result == keys[3:8]
+
+    def test_range_no_overlap(self):
+        t = tree_from(("aaa", 1), ("bbb", 2), ("ccc", 3))
+        assert list(t.items(from_key="d", to_key="z")) == []
+        assert list(t.items(from_key="0", to_key="1")) == []
+
+    def test_range_matches_full_scan_filter(self):
+        """Optimized path must agree with naive scan-and-filter."""
+        rng = random.Random(777)
+        t = AdaptiveRadixTree()
+        keys = sorted(set(
+            "".join(rng.choices(string.ascii_lowercase, k=rng.randint(1, 8)))
+            for _ in range(500)
+        ))
+        for k in keys:
+            t.put(k, k)
+        for _ in range(50):
+            i = rng.randint(0, len(keys) - 1)
+            j = rng.randint(i, min(i + 50, len(keys) - 1))
+            lo, hi = keys[i], keys[j]
+            result = list(t.items(from_key=lo, to_key=hi))
+            expected = [(k, k) for k in keys if lo <= k <= hi]
+            assert result == expected, f"range [{lo!r}, {hi!r}]"

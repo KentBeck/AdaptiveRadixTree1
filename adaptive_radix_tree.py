@@ -445,6 +445,117 @@ def _iter_all(node):
         yield from _iter_all(child)
 
 
+def _iter_range(node, depth, lo, hi):
+    """Yield items in ``[lo, hi]`` from *node*'s subtree – O(log n + k).
+
+    *lo* and *hi* are ``bytes`` or ``None`` (unconstrained).
+
+    At every inner node the algorithm:
+
+    1. Compares the node prefix with the remaining bound bytes to decide
+       whether the entire subtree is outside the range (prune) or whether
+       the bound is still "active" at the child level.
+    2. Uses the next bound byte to skip children before *lo* or after *hi*.
+    3. Passes the bound only to children on the exact boundary byte; all
+       other in-range children are scanned unconditionally.
+
+    This gives O(depth) boundary work plus O(k) for the k results –
+    the same complexity class as a B-tree range scan.
+    """
+    if node is None:
+        return
+
+    if isinstance(node, _Leaf):
+        kb = node.key_bytes
+        if lo is not None and kb < lo:
+            return
+        if hi is not None and kb > hi:
+            return
+        yield node.key, node.value
+        return
+
+    # ── inner node ──────────────────────────────────────────────────
+    p = node.prefix
+    plen = len(p)
+    nd = depth + plen           # depth after consuming prefix
+
+    # ── lo boundary analysis ────────────────────────────────────────
+    lo_on = False               # still tracking the lo boundary?
+    if lo is not None:
+        lo_avail = len(lo) - depth
+        if lo_avail <= 0:
+            # lo already consumed → everything here ≥ lo
+            lo = None
+        elif plen == 0:
+            lo_on = True        # decide at child level
+        else:
+            cn = min(plen, lo_avail)
+            pp = p[:cn]
+            lp = lo[depth:depth + cn]
+            if pp < lp:
+                return          # whole subtree < lo
+            if pp > lp:
+                lo = None       # past lo → no lower constraint
+            elif cn < plen:
+                lo = None       # lo exhausted inside prefix → past lo
+            elif lo_avail > plen:
+                lo_on = True    # lo has more bytes → check children
+            else:
+                lo = None       # lo exhausted exactly at nd
+
+    # ── hi boundary analysis ────────────────────────────────────────
+    hi_on = False
+    if hi is not None:
+        hi_avail = len(hi) - depth
+        if hi_avail <= 0:
+            # hi exhausted → only this node's own value could match
+            if node.value is not _EMPTY:
+                kb = node.key_bytes
+                if (lo is None or kb >= lo) and kb <= hi:
+                    yield node.key, node.value
+            return
+        elif plen == 0:
+            hi_on = True
+        else:
+            cn = min(plen, hi_avail)
+            pp = p[:cn]
+            hp = hi[depth:depth + cn]
+            if pp > hp:
+                return          # whole subtree > hi
+            if pp < hp:
+                hi = None       # before hi → no upper constraint
+            elif cn < plen:
+                return          # hi exhausted inside prefix → keys > hi
+            elif hi_avail > plen:
+                hi_on = True
+            else:
+                # hi exhausted at nd; own value may equal hi, children > hi
+                if node.value is not _EMPTY:
+                    kb = node.key_bytes
+                    if (lo is None or kb >= lo) and kb <= hi:
+                        yield node.key, node.value
+                return
+
+    # ── yield own value ─────────────────────────────────────────────
+    if node.value is not _EMPTY:
+        kb = node.key_bytes
+        if (lo is None or kb >= lo) and (hi is None or kb <= hi):
+            yield node.key, node.value
+
+    # ── visit children with byte-level pruning ──────────────────────
+    lo_byte = lo[nd] if lo_on else -1
+    hi_byte = hi[nd] if hi_on else 256
+
+    for byte, child in node.children():
+        if byte < lo_byte:
+            continue
+        if byte > hi_byte:
+            return
+        child_lo = lo if lo_on and byte == lo_byte else None
+        child_hi = hi if hi_on and byte == hi_byte else None
+        yield from _iter_range(child, nd + 1, child_lo, child_hi)
+
+
 # --------------------------------------------------------------------------
 # Public API
 # --------------------------------------------------------------------------
@@ -503,12 +614,12 @@ class AdaptiveRadixTree:
         to_key : str, optional
             Only yield keys ``<= to_key``.
         """
-        for k, v in _iter_all(self._root):
-            if from_key is not None and k < from_key:
-                continue
-            if to_key is not None and k > to_key:
-                return
-            yield k, v
+        if from_key is None and to_key is None:
+            yield from _iter_all(self._root)
+        else:
+            lo = _to_bytes(from_key) if from_key is not None else None
+            hi = _to_bytes(to_key) if to_key is not None else None
+            yield from _iter_range(self._root, 0, lo, hi)
 
     # -- internal ----------------------------------------------------------
 
