@@ -50,29 +50,7 @@ impl<V> NodePtr<V> {
         NodePtr(raw | TAG_LEAF, std::marker::PhantomData)
     }
 
-    fn from_node4(node: Box<Node4<V>>) -> Self {
-        let raw = Box::into_raw(node) as usize;
-        debug_assert!(raw & TAG_MASK == 0);
-        NodePtr(raw | KIND_NODE4, std::marker::PhantomData)
-    }
-
-    fn from_node16(node: Box<Node16<V>>) -> Self {
-        let raw = Box::into_raw(node) as usize;
-        debug_assert!(raw & TAG_MASK == 0);
-        NodePtr(raw | KIND_NODE16, std::marker::PhantomData)
-    }
-
-    fn from_node48(node: Box<Node48<V>>) -> Self {
-        let raw = Box::into_raw(node) as usize;
-        debug_assert!(raw & TAG_MASK == 0);
-        NodePtr(raw | KIND_NODE48, std::marker::PhantomData)
-    }
-
-    fn from_node256(node: Box<Node256<V>>) -> Self {
-        let raw = Box::into_raw(node) as usize;
-        debug_assert!(raw & TAG_MASK == 0);
-        NodePtr(raw | KIND_NODE256, std::marker::PhantomData)
-    }
+    // from_node* constructors removed — use alloc_node4/16/48/256 instead
 
     // -- accessors --
 
@@ -103,11 +81,6 @@ impl<V> NodePtr<V> {
         debug_assert!(self.kind() == KIND_NODE4);
         unsafe { &mut *(self.inner_ptr() as *mut Node4<V>) }
     }
-    fn into_node4_box(self) -> Box<Node4<V>> {
-        debug_assert!(self.kind() == KIND_NODE4);
-        unsafe { Box::from_raw(self.inner_ptr() as *mut Node4<V>) }
-    }
-
     fn as_node16(&self) -> &Node16<V> {
         debug_assert!(self.kind() == KIND_NODE16);
         unsafe { &*(self.inner_ptr() as *const Node16<V>) }
@@ -116,11 +89,6 @@ impl<V> NodePtr<V> {
         debug_assert!(self.kind() == KIND_NODE16);
         unsafe { &mut *(self.inner_ptr() as *mut Node16<V>) }
     }
-    fn into_node16_box(self) -> Box<Node16<V>> {
-        debug_assert!(self.kind() == KIND_NODE16);
-        unsafe { Box::from_raw(self.inner_ptr() as *mut Node16<V>) }
-    }
-
     fn as_node48(&self) -> &Node48<V> {
         debug_assert!(self.kind() == KIND_NODE48);
         unsafe { &*(self.inner_ptr() as *const Node48<V>) }
@@ -129,11 +97,6 @@ impl<V> NodePtr<V> {
         debug_assert!(self.kind() == KIND_NODE48);
         unsafe { &mut *(self.inner_ptr() as *mut Node48<V>) }
     }
-    fn into_node48_box(self) -> Box<Node48<V>> {
-        debug_assert!(self.kind() == KIND_NODE48);
-        unsafe { Box::from_raw(self.inner_ptr() as *mut Node48<V>) }
-    }
-
     fn as_node256(&self) -> &Node256<V> {
         debug_assert!(self.kind() == KIND_NODE256);
         unsafe { &*(self.inner_ptr() as *const Node256<V>) }
@@ -142,13 +105,8 @@ impl<V> NodePtr<V> {
         debug_assert!(self.kind() == KIND_NODE256);
         unsafe { &mut *(self.inner_ptr() as *mut Node256<V>) }
     }
-    fn into_node256_box(self) -> Box<Node256<V>> {
-        debug_assert!(self.kind() == KIND_NODE256);
-        unsafe { Box::from_raw(self.inner_ptr() as *mut Node256<V>) }
-    }
-
     /// Free the memory behind this pointer (recursively for inner nodes).
-    unsafe fn drop_recursive(self) {
+    unsafe fn drop_recursive(mut self) {
         if self.is_null() {
             return;
         }
@@ -156,42 +114,35 @@ impl<V> NodePtr<V> {
             drop_leaf(self);
             return;
         }
+        // Drop the value if present
         match self.kind() {
             KIND_NODE4 => {
-                let b = self.into_node4_box();
-                for i in 0..b.count as usize {
-                    b.children[i].drop_recursive();
-                }
-                drop(b);
+                let n = self.as_node4_mut();
+                std::ptr::drop_in_place(&mut n.value);
+                for i in 0..n.count as usize { n.children[i].drop_recursive(); }
             }
             KIND_NODE16 => {
-                let b = self.into_node16_box();
-                for i in 0..b.count as usize {
-                    b.children[i].drop_recursive();
-                }
-                drop(b);
+                let n = self.as_node16_mut();
+                std::ptr::drop_in_place(&mut n.value);
+                for i in 0..n.count as usize { n.children[i].drop_recursive(); }
             }
             KIND_NODE48 => {
-                let b = self.into_node48_box();
+                let n = self.as_node48_mut();
+                std::ptr::drop_in_place(&mut n.value);
                 for i in 0..256usize {
-                    let idx = b.index[i];
-                    if idx != 0xFF {
-                        b.slots[idx as usize].drop_recursive();
-                    }
+                    if n.index[i] != 0xFF { n.slots[n.index[i] as usize].drop_recursive(); }
                 }
-                drop(b);
             }
             KIND_NODE256 => {
-                let b = self.into_node256_box();
+                let n = self.as_node256_mut();
+                std::ptr::drop_in_place(&mut n.value);
                 for i in 0..256usize {
-                    if !b.children[i].is_null() {
-                        b.children[i].drop_recursive();
-                    }
+                    if !n.children[i].is_null() { n.children[i].drop_recursive(); }
                 }
-                drop(b);
             }
             _ => unreachable!(),
         }
+        dealloc_inner_shell(self);
     }
 }
 
@@ -261,103 +212,142 @@ unsafe fn drop_leaf<V>(node: NodePtr<V>) {
 // ---------------------------------------------------------------------------
 // Inner node header (common fields)
 // ---------------------------------------------------------------------------
-// Each inner node stores: prefix, optional value (for prefix-key storage),
-// and children keyed by a single byte.
+// Each inner node stores: prefix (inline trailing bytes), optional value
+// (for prefix-key storage), and children keyed by a single byte.
 
 /// Optional value on an inner node (when a key is a prefix of longer keys).
 type InnerValue<V> = Option<(Vec<u8>, V)>; // (full_key, value)
 
 // ---------------------------------------------------------------------------
-// Node4
+// Node types — prefix bytes stored inline after each struct (#[repr(C)])
 // ---------------------------------------------------------------------------
 
-struct Node4<V> {
-    prefix: Vec<u8>,
-    value: InnerValue<V>,
-    count: u8,
-    keys: [u8; 4],
-    children: [NodePtr<V>; 4],
-}
-
-impl<V> Node4<V> {
-    fn new() -> Self {
-        Node4 {
-            prefix: Vec::new(),
-            value: None,
-            count: 0,
-            keys: [0; 4],
-            children: [NodePtr::NULL; 4],
+macro_rules! define_node {
+    ($name:ident { $($field:ident : $ty:ty = $init:expr),* $(,)? }) => {
+        #[repr(C)]
+        struct $name<V> {
+            prefix_len: u16,
+            value: InnerValue<V>,
+            count: u8,
+            $($field: $ty,)*
+            // [u8; prefix_len] follows immediately in memory
         }
-    }
-}
 
-// ---------------------------------------------------------------------------
-// Node16
-// ---------------------------------------------------------------------------
-
-struct Node16<V> {
-    prefix: Vec<u8>,
-    value: InnerValue<V>,
-    count: u8,
-    keys: [u8; 16],
-    children: [NodePtr<V>; 16],
-}
-
-impl<V> Node16<V> {
-    fn new() -> Self {
-        Node16 {
-            prefix: Vec::new(),
-            value: None,
-            count: 0,
-            keys: [0; 16],
-            children: [NodePtr::NULL; 16],
+        impl<V> $name<V> {
+            fn prefix(&self) -> &[u8] {
+                unsafe {
+                    let base = (self as *const Self as *const u8)
+                        .add(std::mem::size_of::<Self>());
+                    std::slice::from_raw_parts(base, self.prefix_len as usize)
+                }
+            }
         }
-    }
+    };
 }
 
-// ---------------------------------------------------------------------------
-// Node48
-// ---------------------------------------------------------------------------
+define_node!(Node4 { keys: [u8; 4] = [0; 4], children: [NodePtr<V>; 4] = [NodePtr::NULL; 4] });
+define_node!(Node16 { keys: [u8; 16] = [0; 16], children: [NodePtr<V>; 16] = [NodePtr::NULL; 16] });
+define_node!(Node48 { index: [u8; 256] = [0xFF; 256], slots: [NodePtr<V>; 48] = [NodePtr::NULL; 48] });
 
-struct Node48<V> {
-    prefix: Vec<u8>,
-    value: InnerValue<V>,
-    count: u8,
-    index: [u8; 256],       // byte -> slot index (0xFF = empty)
-    slots: [NodePtr<V>; 48],
-}
-
-impl<V> Node48<V> {
-    fn new() -> Self {
-        Node48 {
-            prefix: Vec::new(),
-            value: None,
-            count: 0,
-            index: [0xFF; 256],
-            slots: [NodePtr::NULL; 48],
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Node256
-// ---------------------------------------------------------------------------
-
+// Node256 has u16 count (> 48 children possible), so define it separately.
+#[repr(C)]
 struct Node256<V> {
-    prefix: Vec<u8>,
+    prefix_len: u16,
     value: InnerValue<V>,
     count: u16,
     children: [NodePtr<V>; 256],
+    // [u8; prefix_len] follows
+}
+impl<V> Node256<V> {
+    fn prefix(&self) -> &[u8] {
+        unsafe {
+            let base = (self as *const Self as *const u8)
+                .add(std::mem::size_of::<Self>());
+            std::slice::from_raw_parts(base, self.prefix_len as usize)
+        }
+    }
 }
 
-impl<V> Node256<V> {
-    fn new() -> Self {
-        Node256 {
-            prefix: Vec::new(),
-            value: None,
-            count: 0,
-            children: [NodePtr::NULL; 256],
+// ---------------------------------------------------------------------------
+// Inner node allocation helpers
+// ---------------------------------------------------------------------------
+
+fn node_layout<T>(prefix_len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(
+        std::mem::size_of::<T>() + prefix_len,
+        std::mem::align_of::<T>(),
+    )
+    .unwrap()
+}
+
+/// Allocate an inner node with the given prefix bytes. Initializes all
+/// fixed fields to zero/null/None; caller must set children/count/etc.
+macro_rules! alloc_node {
+    ($name:ident, $kind:expr, $prefix:expr $(, $field:ident = $val:expr)*) => {{
+        let prefix: &[u8] = $prefix;
+        let layout = node_layout::<$name<V>>(prefix.len());
+        unsafe {
+            let ptr = std::alloc::alloc(layout) as *mut $name<V>;
+            assert!(!ptr.is_null(), "allocation failed");
+            std::ptr::write(&mut (*ptr).prefix_len, prefix.len() as u16);
+            std::ptr::write(&mut (*ptr).value, None);
+            std::ptr::write(&mut (*ptr).count, 0);
+            $(std::ptr::write(&mut (*ptr).$field, $val);)*
+            // Copy prefix bytes
+            let dst = (ptr as *mut u8).add(std::mem::size_of::<$name<V>>());
+            std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst, prefix.len());
+            NodePtr(ptr as usize | $kind, std::marker::PhantomData)
         }
+    }};
+}
+
+fn alloc_node4<V>(prefix: &[u8]) -> NodePtr<V> {
+    alloc_node!(Node4, KIND_NODE4, prefix,
+        keys = [0u8; 4],
+        children = [NodePtr::NULL; 4])
+}
+
+fn alloc_node16<V>(prefix: &[u8]) -> NodePtr<V> {
+    alloc_node!(Node16, KIND_NODE16, prefix,
+        keys = [0u8; 16],
+        children = [NodePtr::NULL; 16])
+}
+
+fn alloc_node48<V>(prefix: &[u8]) -> NodePtr<V> {
+    alloc_node!(Node48, KIND_NODE48, prefix,
+        index = [0xFFu8; 256],
+        slots = [NodePtr::NULL; 48])
+}
+
+fn alloc_node256<V>(prefix: &[u8]) -> NodePtr<V> {
+    unsafe {
+        let layout = node_layout::<Node256<V>>(prefix.len());
+        let ptr = std::alloc::alloc(layout) as *mut Node256<V>;
+        assert!(!ptr.is_null(), "allocation failed");
+        std::ptr::write(&mut (*ptr).prefix_len, prefix.len() as u16);
+        std::ptr::write(&mut (*ptr).value, None);
+        std::ptr::write(&mut (*ptr).count, 0);
+        std::ptr::write(&mut (*ptr).children, [NodePtr::NULL; 256]);
+        let dst = (ptr as *mut u8).add(std::mem::size_of::<Node256<V>>());
+        std::ptr::copy_nonoverlapping(prefix.as_ptr(), dst, prefix.len());
+        NodePtr(ptr as usize | KIND_NODE256, std::marker::PhantomData)
+    }
+}
+
+/// Deallocate an inner node shell (no child recursion, no value drop).
+/// Used after children/value have been moved out.
+fn dealloc_inner_shell<V>(node: NodePtr<V>) {
+    unsafe {
+        let ptr = node.inner_ptr();
+        let (size_of, align_of, plen) = match node.kind() {
+            KIND_NODE4 => (std::mem::size_of::<Node4<V>>(), std::mem::align_of::<Node4<V>>(), (*(ptr as *const Node4<V>)).prefix_len as usize),
+            KIND_NODE16 => (std::mem::size_of::<Node16<V>>(), std::mem::align_of::<Node16<V>>(), (*(ptr as *const Node16<V>)).prefix_len as usize),
+            KIND_NODE48 => (std::mem::size_of::<Node48<V>>(), std::mem::align_of::<Node48<V>>(), (*(ptr as *const Node48<V>)).prefix_len as usize),
+            KIND_NODE256 => (std::mem::size_of::<Node256<V>>(), std::mem::align_of::<Node256<V>>(), (*(ptr as *const Node256<V>)).prefix_len as usize),
+            _ => unreachable!(),
+        };
+        let layout = std::alloc::Layout::from_size_align_unchecked(size_of + plen, align_of);
+        std::alloc::dealloc(ptr, layout);
     }
 }
 
@@ -721,16 +711,17 @@ fn push_range_children_rev<'a, V>(
 // Inner node field accessors (dispatch on kind)
 // ---------------------------------------------------------------------------
 
-/// Get prefix from inner node. Caller must ensure node is a valid inner node pointer.
+/// Get prefix from inner node (reads inline trailing bytes).
 unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
     let ptr = node.inner_ptr();
-    match node.kind() {
-        KIND_NODE4 => &(*(ptr as *const Node4<V>)).prefix,
-        KIND_NODE16 => &(*(ptr as *const Node16<V>)).prefix,
-        KIND_NODE48 => &(*(ptr as *const Node48<V>)).prefix,
-        KIND_NODE256 => &(*(ptr as *const Node256<V>)).prefix,
+    let (size_of, plen) = match node.kind() {
+        KIND_NODE4 => (std::mem::size_of::<Node4<V>>(), (*(ptr as *const Node4<V>)).prefix_len as usize),
+        KIND_NODE16 => (std::mem::size_of::<Node16<V>>(), (*(ptr as *const Node16<V>)).prefix_len as usize),
+        KIND_NODE48 => (std::mem::size_of::<Node48<V>>(), (*(ptr as *const Node48<V>)).prefix_len as usize),
+        KIND_NODE256 => (std::mem::size_of::<Node256<V>>(), (*(ptr as *const Node256<V>)).prefix_len as usize),
         _ => unreachable!(),
-    }
+    };
+    std::slice::from_raw_parts(ptr.add(size_of), plen)
 }
 
 /// Get value stored on inner node. Caller must ensure node is valid.
@@ -895,13 +886,56 @@ fn inner_count<V>(node: &NodePtr<V>) -> usize {
     }
 }
 
-fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Vec<u8>) {
-    match node.kind() {
-        KIND_NODE4 => node.as_node4_mut().prefix = prefix,
-        KIND_NODE16 => node.as_node16_mut().prefix = prefix,
-        KIND_NODE48 => node.as_node48_mut().prefix = prefix,
-        KIND_NODE256 => node.as_node256_mut().prefix = prefix,
-        _ => unreachable!(),
+/// Change the prefix of an inner node. Reallocates and returns a new NodePtr
+/// since the inline trailing bytes change size. Frees the old allocation.
+fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: &[u8]) {
+    unsafe {
+        let old = *node;
+        let new = match old.kind() {
+            KIND_NODE4 => {
+                let mut n = alloc_node4::<V>(&prefix);
+                let src = old.as_node4();
+                let dst = n.as_node4_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&src.value));
+                dst.count = src.count;
+                dst.keys = src.keys;
+                dst.children = src.children;
+                n
+            }
+            KIND_NODE16 => {
+                let mut n = alloc_node16::<V>(&prefix);
+                let src = old.as_node16();
+                let dst = n.as_node16_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&src.value));
+                dst.count = src.count;
+                dst.keys = src.keys;
+                dst.children = src.children;
+                n
+            }
+            KIND_NODE48 => {
+                let mut n = alloc_node48::<V>(&prefix);
+                let src = old.as_node48();
+                let dst = n.as_node48_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&src.value));
+                dst.count = src.count;
+                dst.index = src.index;
+                dst.slots = src.slots;
+                n
+            }
+            KIND_NODE256 => {
+                let mut n = alloc_node256::<V>(&prefix);
+                let src = old.as_node256();
+                let dst = n.as_node256_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&src.value));
+                dst.count = src.count;
+                dst.children = src.children;
+                n
+            }
+            _ => unreachable!(),
+        };
+        // Free old allocation without dropping value or recursing children
+        dealloc_inner_shell(old);
+        *node = new;
     }
 }
 
@@ -926,63 +960,45 @@ fn inner_has_value<V>(node: &NodePtr<V>) -> bool {
     }
 }
 
-/// Move header (prefix + value) from src to dst. Src's prefix/value become empty/None.
-fn inner_move_header<V>(src: &mut NodePtr<V>, dst: &mut NodePtr<V>) {
-    let prefix = inner_take_prefix(src);
-    let value = inner_clear_value(src);
-    inner_set_prefix(dst, prefix);
-    match dst.kind() {
-        KIND_NODE4 => dst.as_node4_mut().value = value,
-        KIND_NODE16 => dst.as_node16_mut().value = value,
-        KIND_NODE48 => dst.as_node48_mut().value = value,
-        KIND_NODE256 => dst.as_node256_mut().value = value,
-        _ => unreachable!(),
-    }
-}
-
 // ---------------------------------------------------------------------------
-// Node growth
+// Node growth — allocate next size, copy prefix+value+children, free old
 // ---------------------------------------------------------------------------
 
-fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
-    match node.kind() {
-        KIND_NODE4 => {
-            let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node4();
-            let cnt = old.count as usize;
-            {
+fn grow<V>(node: NodePtr<V>) -> NodePtr<V> {
+    unsafe {
+        let prefix = inner_prefix_raw(node).to_vec();
+        match node.kind() {
+            KIND_NODE4 => {
+                let mut new_ptr = alloc_node16::<V>(&prefix);
+                let old = node.as_node4();
+                let cnt = old.count as usize;
                 let dst = new_ptr.as_node16_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&old.value));
                 dst.keys[..cnt].copy_from_slice(&old.keys[..cnt]);
                 dst.children[..cnt].copy_from_slice(&old.children[..cnt]);
                 dst.count = cnt as u8;
+                dealloc_inner_shell(node);
+                new_ptr
             }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE16 => {
-            let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node16();
-            let cnt = old.count as usize;
-            {
+            KIND_NODE16 => {
+                let mut new_ptr = alloc_node48::<V>(&prefix);
+                let old = node.as_node16();
+                let cnt = old.count as usize;
                 let dst = new_ptr.as_node48_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&old.value));
                 for i in 0..cnt {
-                    let b = old.keys[i];
-                    dst.index[b as usize] = i as u8;
+                    dst.index[old.keys[i] as usize] = i as u8;
                     dst.slots[i] = old.children[i];
                 }
                 dst.count = cnt as u8;
+                dealloc_inner_shell(node);
+                new_ptr
             }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE48 => {
-            let mut new_ptr = NodePtr::from_node256(Box::new(Node256::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node48();
-            {
+            KIND_NODE48 => {
+                let mut new_ptr = alloc_node256::<V>(&prefix);
+                let old = node.as_node48();
                 let dst = new_ptr.as_node256_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&old.value));
                 let mut cnt = 0u16;
                 for b in 0..256usize {
                     let idx = old.index[b];
@@ -992,11 +1008,11 @@ fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
                     }
                 }
                 dst.count = cnt;
+                dealloc_inner_shell(node);
+                new_ptr
             }
-            free_inner_node_shell(node);
-            new_ptr
+            _ => unreachable!("Node256 cannot grow"),
         }
-        _ => unreachable!("Node256 cannot grow"),
     }
 }
 
@@ -1004,14 +1020,15 @@ fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
 // Node shrinkage
 // ---------------------------------------------------------------------------
 
-fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
-    match node.kind() {
-        KIND_NODE256 => {
-            let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node256();
-            {
+fn shrink<V>(node: NodePtr<V>) -> NodePtr<V> {
+    unsafe {
+        let prefix = inner_prefix_raw(node).to_vec();
+        match node.kind() {
+            KIND_NODE256 => {
+                let mut new_ptr = alloc_node48::<V>(&prefix);
+                let old = node.as_node256();
                 let dst = new_ptr.as_node48_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&old.value));
                 let mut slot = 0u8;
                 for b in 0..256usize {
                     if !old.children[b].is_null() {
@@ -1021,16 +1038,14 @@ fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
                     }
                 }
                 dst.count = slot;
+                dealloc_inner_shell(node);
+                new_ptr
             }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE48 => {
-            let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node48();
-            {
+            KIND_NODE48 => {
+                let mut new_ptr = alloc_node16::<V>(&prefix);
+                let old = node.as_node48();
                 let dst = new_ptr.as_node16_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&old.value));
                 let mut cnt = 0usize;
                 for b in 0..256usize {
                     let idx = old.index[b];
@@ -1041,25 +1056,23 @@ fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
                     }
                 }
                 dst.count = cnt as u8;
+                dealloc_inner_shell(node);
+                new_ptr
             }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE16 => {
-            let mut new_ptr = NodePtr::from_node4(Box::new(Node4::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node16();
-            let cnt = old.count as usize;
-            {
+            KIND_NODE16 => {
+                let mut new_ptr = alloc_node4::<V>(&prefix);
+                let old = node.as_node16();
+                let cnt = old.count as usize;
                 let dst = new_ptr.as_node4_mut();
+                std::ptr::write(&mut dst.value, std::ptr::read(&old.value));
                 dst.keys[..cnt].copy_from_slice(&old.keys[..cnt]);
                 dst.children[..cnt].copy_from_slice(&old.children[..cnt]);
                 dst.count = cnt as u8;
+                dealloc_inner_shell(node);
+                new_ptr
             }
-            free_inner_node_shell(node);
-            new_ptr
+            _ => node, // Node4 cannot shrink further
         }
-        _ => node, // Node4 cannot shrink further
     }
 }
 
@@ -1161,15 +1174,9 @@ fn inner_clear_value<V>(node: &mut NodePtr<V>) -> InnerValue<V> {
     }
 }
 
-/// Get prefix, consuming it (replacing with empty vec).
-fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Vec<u8> {
-    match node.kind() {
-        KIND_NODE4 => std::mem::take(&mut node.as_node4_mut().prefix),
-        KIND_NODE16 => std::mem::take(&mut node.as_node16_mut().prefix),
-        KIND_NODE48 => std::mem::take(&mut node.as_node48_mut().prefix),
-        KIND_NODE256 => std::mem::take(&mut node.as_node256_mut().prefix),
-        _ => unreachable!(),
-    }
+/// Read the prefix into a Vec (copies the inline bytes).
+fn inner_read_prefix<V>(node: &NodePtr<V>) -> Vec<u8> {
+    unsafe { inner_prefix_raw(*node) }.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,15 +1189,12 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
 
     if count == 0 {
         if inner_has_value(&node) {
-            // Convert to leaf
             let val = inner_clear_value(&mut node);
-            // Free the inner node
-            free_inner_node_shell(node);
+            dealloc_inner_shell(node);
             let (k, v) = val.unwrap();
             return alloc_leaf(&k, v);
         }
-        // Totally empty — free and return null
-        free_inner_node_shell(node);
+        dealloc_inner_shell(node);
         return NodePtr::NULL;
     }
 
@@ -1198,23 +1202,21 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
         let children = inner_children(&node);
         let (b, child) = children[0];
         if child.is_leaf() {
-            // Single leaf child, no value: collapse to just the leaf
-            free_inner_node_shell(node);
+            dealloc_inner_shell(node);
             return child;
         }
-        // Single inner child: merge prefixes: parent.prefix + byte + child.prefix
-        let parent_prefix = unsafe { inner_prefix_raw(node) }.to_vec();
-        free_inner_node_shell(node);
-        let mut child = child;
-        let child_prefix = inner_take_prefix(&mut child);
+        // Single inner child: merge prefixes
+        let parent_prefix = inner_read_prefix(&node);
+        let child_prefix = inner_read_prefix(&child);
+        dealloc_inner_shell(node);
         let mut merged = parent_prefix;
         merged.push(b);
         merged.extend_from_slice(&child_prefix);
-        inner_set_prefix(&mut child, merged);
+        let mut child = child;
+        inner_set_prefix(&mut child, &merged);
         return child;
     }
 
-    // Check shrink thresholds
     let should_shrink = match node.kind() {
         KIND_NODE256 => count <= 48,
         KIND_NODE48 => count <= 16,
@@ -1228,40 +1230,7 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
     node
 }
 
-/// Free an inner node's Box without recursively dropping children.
-fn free_inner_node_shell<V>(node: NodePtr<V>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let mut b = node.into_node4_box();
-            b.count = 0;
-            b.value = None;
-            drop(b);
-        }
-        KIND_NODE16 => {
-            let mut b = node.into_node16_box();
-            b.count = 0;
-            b.value = None;
-            drop(b);
-        }
-        KIND_NODE48 => {
-            let mut b = node.into_node48_box();
-            b.count = 0;
-            b.value = None;
-            b.index = [0xFF; 256];
-            drop(b);
-        }
-        KIND_NODE256 => {
-            let mut b = node.into_node256_box();
-            b.count = 0;
-            b.value = None;
-            for c in b.children.iter_mut() {
-                *c = NodePtr::NULL;
-            }
-            drop(b);
-        }
-        _ => unreachable!(),
-    }
-}
+// free_inner_node_shell removed — use dealloc_inner_shell directly
 
 // ---------------------------------------------------------------------------
 // Recursive delete
@@ -1346,10 +1315,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         let common = prefix_mismatch(key, depth, &ekb, depth);
         let sd = depth + common; // split depth
 
-        let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = key[depth..sd].to_vec();
-
-        let mut nn_ptr = NodePtr::from_node4(nn);
+        let mut nn_ptr = alloc_node4::<V>(&key[depth..sd]);
 
         if sd == key.len() {
             // New key is prefix of existing
@@ -1376,14 +1342,11 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
 
     if ml < plen {
         // Partial prefix match -> split this node
-        let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = prefix[..ml].to_vec();
-        let mut nn_ptr = NodePtr::from_node4(nn);
+        let mut nn_ptr = alloc_node4::<V>(&prefix[..ml]);
 
         // Update old node's prefix to suffix after split point
-        let new_prefix = prefix[ml + 1..].to_vec();
         let mut old_node = node;
-        inner_set_prefix(&mut old_node, new_prefix);
+        inner_set_prefix(&mut old_node, &prefix[ml + 1..]);
         inner_add_child(&mut nn_ptr, prefix[ml], old_node);
 
         let nd = depth + ml;
