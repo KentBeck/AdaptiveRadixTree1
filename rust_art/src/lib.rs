@@ -81,11 +81,6 @@ impl<V> NodePtr<V> {
         unsafe { &*((self.0 & !TAG_MASK) as *const Leaf<V>) }
     }
 
-    fn as_leaf_mut(&mut self) -> &mut Leaf<V> {
-        debug_assert!(self.is_leaf());
-        unsafe { &mut *((self.0 & !TAG_MASK) as *mut Leaf<V>) }
-    }
-
     fn into_leaf_box(self) -> Box<Leaf<V>> {
         debug_assert!(self.is_leaf());
         unsafe { Box::from_raw((self.0 & !TAG_MASK) as *mut Leaf<V>) }
@@ -163,21 +158,21 @@ impl<V> NodePtr<V> {
         }
         match self.kind() {
             KIND_NODE4 => {
-                let mut b = self.into_node4_box();
+                let b = self.into_node4_box();
                 for i in 0..b.count as usize {
                     b.children[i].drop_recursive();
                 }
                 drop(b);
             }
             KIND_NODE16 => {
-                let mut b = self.into_node16_box();
+                let b = self.into_node16_box();
                 for i in 0..b.count as usize {
                     b.children[i].drop_recursive();
                 }
                 drop(b);
             }
             KIND_NODE48 => {
-                let mut b = self.into_node48_box();
+                let b = self.into_node48_box();
                 for i in 0..256usize {
                     let idx = b.index[i];
                     if idx != 0xFF {
@@ -187,7 +182,7 @@ impl<V> NodePtr<V> {
                 drop(b);
             }
             KIND_NODE256 => {
-                let mut b = self.into_node256_box();
+                let b = self.into_node256_box();
                 for i in 0..256usize {
                     if !b.children[i].is_null() {
                         b.children[i].drop_recursive();
