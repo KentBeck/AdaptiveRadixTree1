@@ -424,10 +424,42 @@ behind chains of single-child nodes, degrading lookup performance.
 
 ## 8. Iteration
 
-The sorted iterator uses an explicit stack of `NodePtr` values.  When
-an inner node is popped, its children are pushed in reverse byte order
-(so the smallest byte ends up on top), and if the node carries a value
-it's yielded immediately.  Leaves are yielded directly.
+### First version: recursive collect
+
+The first iteration implementation used a recursive function that
+pushed every entry into a caller-supplied `Vec`:
+
+```rust
+unsafe fn iter_all<'a, V>(node: NodePtr<V>, out: &mut Vec<(&'a [u8], &'a V)>) {
+    if node.is_null() { return; }
+    if node.is_leaf() {
+        let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
+        out.push((&leaf.key, &leaf.value));
+        return;
+    }
+    if let Some((k, v)) = inner_value_raw(node) {
+        out.push((k.as_slice(), v));
+    }
+    for (_, child) in inner_children(&node) {
+        iter_all(child, out);
+    }
+}
+```
+
+This was simple but had two allocation costs: the output `Vec` grew to
+hold all n entries, and `inner_children` allocated a temporary `Vec` at
+every inner node to list its children.  At 10 million keys the
+iterate-all benchmark ran at 2.69x BTreeMap's time—the extra
+allocation traffic was measurable.
+
+### Optimization: lazy stack-based iterator
+
+The fix was to replace the recursive collect with a lazy `Iterator`
+that yields one entry at a time.  An explicit stack of `NodePtr`
+values replaces the call stack.  When an inner node is popped, its
+children are pushed in reverse byte order (so the smallest byte ends
+up on top), and if the node carries a value it's yielded immediately.
+Leaves are yielded directly.
 
 ```rust
 impl<'a, V> Iterator for Iter<'a, V> {
@@ -449,12 +481,16 @@ impl<'a, V> Iterator for Iter<'a, V> {
 }
 ```
 
-`push_children_rev` dispatches on node kind.  For Node4/Node16 it
-iterates the keys array in reverse; for Node48/Node256 it scans bytes
-255 down to 0.
+`push_children_rev` dispatches on node kind and writes directly to the
+stack—no temporary `Vec`.  For Node4/Node16 it iterates the keys array
+in reverse; for Node48/Node256 it scans bytes 255 down to 0.
 
 This approach costs O(tree height) stack space, never allocates an
 O(n) buffer, and does total O(n) work across all `next()` calls.
+
+The `items()` and `range()` convenience methods still return a `Vec`
+for callers that want a snapshot, but they now delegate to the lazy
+iterators rather than running their own recursive traversal.
 
 ---
 
@@ -577,6 +613,29 @@ memory scan that the hardware prefetcher loves.  ART iteration chases
 pointers across scattered heap allocations—each `Leaf` and inner node
 is a separate `Box`.  The 2x gap is the cost of pointer-chasing vs.
 cache-line scanning.
+
+### Performance tuning: lazy iterators
+
+The iteration numbers above reflect the optimized lazy iterator.  The
+original recursive `iter_all` function collected every entry into a
+`Vec`, and called `inner_children` (which itself allocates a `Vec`) at
+each inner node.  Those allocations added measurable overhead at scale.
+
+Replacing the recursive collect with the stack-based `Iter` and
+`RangeIter` (see section 8) cut iteration costs significantly at 10
+million keys:
+
+| Operation        | Before |  After | Improvement |
+|------------------|--------|--------|-------------|
+| Iterate all      |  2.69x |  2.06x |  23% faster |
+| Range query (1%) |  2.51x |  2.36x |   6% faster |
+
+The iterate-all improvement comes from eliminating the O(n) output
+`Vec` and the per-node temporary `Vec` from `inner_children`.  Range
+queries benefit less because their cost is dominated by boundary
+analysis at each level rather than allocation overhead.
+
+### The fundamental trade-off
 
 This is the fundamental architectural trade-off: tries give O(key
 length) point operations by eliminating key comparisons, but pay for
