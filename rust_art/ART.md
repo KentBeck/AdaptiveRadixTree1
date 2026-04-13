@@ -80,11 +80,12 @@ reclaim ownership for deallocation.
 A leaf stores the full key and a value.  We keep the full key so that
 `get` can verify an exact match—the trie path only tells you the
 bytes consumed so far, and path compression means some bytes were
-skipped.
+skipped.  The key is a `Box<[u8]>` rather than a `Vec<u8>` because
+keys are write-once—the capacity field would be wasted.
 
 ```rust
 struct Leaf<V> {
-    key: Vec<u8>,
+    key: Box<[u8]>,
     value: V,
 }
 ```
@@ -93,18 +94,46 @@ struct Leaf<V> {
 
 Every inner node carries three things beyond its children:
 
-- **prefix**: a byte slice for path compression.  If a chain of nodes
-  each have exactly one child, we collapse them into a single node
-  whose prefix stores the skipped bytes.
-- **value**: an `Option<(Vec<u8>, V)>`.  When a key like `"ab"` is a
-  prefix of another key like `"abc"`, the value for `"ab"` lives on
-  the inner node at the branch point, not in a leaf.  The `Vec<u8>`
+- **prefix**: an inline `Prefix` for path compression (see below).
+  If a chain of nodes each have exactly one child, we collapse them
+  into a single node whose prefix stores the skipped bytes.
+- **value**: an `Option<(Box<[u8]>, V)>`.  When a key like `"ab"` is
+  a prefix of another key like `"abc"`, the value for `"ab"` lives on
+  the inner node at the branch point, not in a leaf.  The `Box<[u8]>`
   is the full key (for iteration and verification).
 - **count**: how many children are occupied.
 
 ```rust
-type InnerValue<V> = Option<(Vec<u8>, V)>;
+type InnerValue<V> = Option<(Box<[u8]>, V)>;
 ```
+
+### Inline prefix
+
+Every inner node has a path-compression prefix.  The first version
+stored it as `Vec<u8>`—24 bytes (pointer + length + capacity) plus a
+separate heap allocation for the actual bytes.  Since the prefix is
+read at every tree level during traversal, that extra pointer chase
+costs a cache miss per level.
+
+The fix is a small-buffer enum:
+
+```rust
+const INLINE_PREFIX_CAP: usize = 22;
+
+enum Prefix {
+    Inline { len: u8, data: [u8; INLINE_PREFIX_CAP] },
+    Heap(Box<[u8]>),
+}
+```
+
+The `Heap` variant (a `Box<[u8]>` fat pointer) forces this enum to
+24 bytes—the same size as the `Vec<u8>` it replaces.  We use all
+that space: 1 byte discriminant + 1 byte length + 22 bytes of inline
+data.  Prefixes up to 22 bytes live directly in the node struct with
+zero heap allocation; longer prefixes (rare in practice) fall back to
+a heap-allocated `Box<[u8]>`.  For the benchmark workload (keys like
+`key000000000000`), prefixes are typically 1–5 bytes and always fit
+inline.
 
 ### Node4
 
@@ -113,7 +142,7 @@ arrays.  Lookup is a linear scan.
 
 ```rust
 struct Node4<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 4],
@@ -128,7 +157,7 @@ binary search.
 
 ```rust
 struct Node16<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 16],
@@ -145,7 +174,7 @@ single index into the 48-slot array—O(1) regardless of child count.
 
 ```rust
 struct Node48<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     index: [u8; 256],       // byte → slot index (0xFF = empty)
@@ -160,7 +189,7 @@ single array access.
 
 ```rust
 struct Node256<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u16,
     children: [NodePtr<V>; 256],
@@ -634,6 +663,42 @@ The iterate-all improvement comes from eliminating the O(n) output
 `Vec` and the per-node temporary `Vec` from `inner_children`.  Range
 queries benefit less because their cost is dominated by boundary
 analysis at each level rather than allocation overhead.
+
+### Performance tuning: eliminating Vec from nodes
+
+The original implementation used `Vec<u8>` for three fields inside
+every node: the path-compression prefix in each inner node, the key in
+each leaf, and the key in each inner node value.  Each `Vec<u8>` costs
+24 bytes (pointer + length + capacity) plus a separate heap allocation
+for the data—even for a 3-byte prefix like `"key"`.
+
+We eliminated all `Vec<u8>` from the node types in three changes:
+
+1. **Leaf key and inner-value key: `Vec<u8>` → `Box<[u8]>`.**  Keys
+   are write-once, so the capacity field is wasted.  `Box<[u8]>` is
+   16 bytes instead of 24—saves 8 bytes per leaf.
+
+2. **Prefix: `Vec<u8>` → inline `Prefix` enum.**  Short prefixes
+   (≤ 22 bytes) are stored directly in the node struct with zero heap
+   allocation.  The enum is the same 24 bytes as the `Vec` it replaces,
+   so node struct sizes don't change—but the prefix bytes are now in
+   the same cache line as the node's other fields, eliminating one
+   pointer dereference per tree level during traversal.
+
+After these changes, the benchmark at 10 million keys:
+
+| Operation        |     ART |  BTreeMap | Ratio |
+|------------------|---------|-----------|-------|
+| Random put       | 15.505s |   23.963s | 0.65x |
+| Sequential put   |  3.667s |    4.548s | 0.81x |
+| Random get (hit) | 11.034s |   18.473s | 0.60x |
+| Random get (miss)|  0.121s |    1.804s | 0.07x |
+| Iterate all      |  0.605s |    0.324s | 1.87x |
+| Range query (1%) |  0.011s |    0.003s | 3.66x |
+| Random delete    | 15.665s |   18.552s | 0.84x |
+
+Iteration improved from 2.06x to 1.87x—the inline prefix means fewer
+cache misses when visiting each inner node.
 
 ### The fundamental trade-off
 

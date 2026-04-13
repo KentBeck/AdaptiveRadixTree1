@@ -4,7 +4,7 @@
 /// and adaptive node sizes (4, 16, 48, 256) for memory efficiency.
 /// Path compression collapses single-child chains into node prefixes.
 ///
-/// Keys are `Vec<u8>`, values are generic `V`.
+/// Keys are byte slices (`&[u8]`), values are generic `V`.
 
 // ---------------------------------------------------------------------------
 // Tagged pointer
