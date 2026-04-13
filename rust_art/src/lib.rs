@@ -211,7 +211,7 @@ struct Leaf<V> {
 // and children keyed by a single byte.
 
 /// Optional value on an inner node (when a key is a prefix of longer keys).
-type InnerValue<V> = Option<(Vec<u8>, V)>; // (full_key, value)
+type InnerValue<V> = Option<(Box<[u8]>, V)>; // (full_key, value)
 
 // ---------------------------------------------------------------------------
 // Node4
@@ -449,7 +449,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
             push_children_rev(node, &mut self.stack);
             // Yield own value if present
             if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                return Some((k.as_slice(), v));
+                return Some((k, v));
             }
         }
     }
@@ -560,7 +560,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                 if hi_avail == 0 {
                     // hi exhausted: only own value could match
                     if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                        let kb = k.as_slice();
+                        let kb = k;
                         if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
                             return Some((kb, v));
                         }
@@ -579,7 +579,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                     else {
                         // hi exhausted at nd; own value may match, children > hi
                         if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                            let kb = k.as_slice();
+                            let kb = k;
                             if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
                                 return Some((kb, v));
                             }
@@ -600,7 +600,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
 
             // Yield own value if in range
             if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                let kb = k.as_slice();
+                let kb = k;
                 if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
                     return Some((kb, v));
                 }
@@ -680,16 +680,16 @@ unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
 }
 
 /// Get value stored on inner node. Caller must ensure node is valid.
-unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a Vec<u8>, &'a V)> {
+unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> {
     let ptr = node.inner_ptr();
-    let opt: &Option<(Vec<u8>, V)> = match node.kind() {
+    let opt: &Option<(Box<[u8]>, V)> = match node.kind() {
         KIND_NODE4 => &(*(ptr as *const Node4<V>)).value,
         KIND_NODE16 => &(*(ptr as *const Node16<V>)).value,
         KIND_NODE48 => &(*(ptr as *const Node48<V>)).value,
         KIND_NODE256 => &(*(ptr as *const Node256<V>)).value,
         _ => unreachable!(),
     };
-    opt.as_ref().map(|(k, v)| (k, v))
+    opt.as_ref().map(|(k, v)| (&**k, v))
 }
 
 /// Find child by byte key in inner node. Returns NULL if not found.
@@ -851,7 +851,7 @@ fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Vec<u8>) {
     }
 }
 
-fn inner_set_value<V>(node: &mut NodePtr<V>, key: Vec<u8>, value: V) {
+fn inner_set_value<V>(node: &mut NodePtr<V>, key: Box<[u8]>, value: V) {
     let val = Some((key, value));
     match node.kind() {
         KIND_NODE4 => node.as_node4_mut().value = val,
@@ -1133,7 +1133,7 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
             // Free the inner node
             free_inner_node_shell(node);
             let (k, v) = val.unwrap();
-            return NodePtr::from_leaf(Box::new(Leaf { key: k.into_boxed_slice(), value: v }));
+            return NodePtr::from_leaf(Box::new(Leaf { key: k, value: v }));
         }
         // Totally empty — free and return null
         free_inner_node_shell(node);
@@ -1301,13 +1301,12 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
 
         if sd == key.len() {
             // New key is prefix of existing
-            inner_set_value(&mut nn_ptr, key.to_vec(), value);
+            inner_set_value(&mut nn_ptr, Box::from(key), value);
             inner_add_child(&mut nn_ptr, ekb[sd], node);
         } else if sd == ekb.len() {
             // Existing key is prefix of new key
-            let ekb_clone = ekb.to_vec();
             let existing_box = node.into_leaf_box();
-            inner_set_value(&mut nn_ptr, ekb_clone, existing_box.value);
+            inner_set_value(&mut nn_ptr, existing_box.key, existing_box.value);
             let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[sd], NodePtr::from_leaf(new_leaf));
         } else {
@@ -1340,7 +1339,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
 
         let nd = depth + ml;
         if nd == key.len() {
-            inner_set_value(&mut nn_ptr, key.to_vec(), value);
+            inner_set_value(&mut nn_ptr, Box::from(key), value);
         } else {
             let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[nd], NodePtr::from_leaf(new_leaf));
@@ -1355,7 +1354,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
     if nd == key.len() {
         // Key exhausted at this inner node - store value here
         let added = !inner_has_value(&node);
-        inner_set_value(&mut node, key.to_vec(), value);
+        inner_set_value(&mut node, Box::from(key), value);
         return (node, added, unsafe { std::mem::zeroed() });
     }
 
