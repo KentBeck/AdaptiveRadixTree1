@@ -214,11 +214,52 @@ struct Leaf<V> {
 type InnerValue<V> = Option<(Box<[u8]>, V)>; // (full_key, value)
 
 // ---------------------------------------------------------------------------
+// Inline prefix — avoids a heap allocation for short prefixes
+// ---------------------------------------------------------------------------
+// The Heap variant (Box<[u8]> fat pointer) forces this enum to 24 bytes.
+// We use all that space: 1 byte tag + 1 byte len + 22 bytes data = 24.
+// Prefixes up to 22 bytes are stored inline with zero heap allocation.
+
+const INLINE_PREFIX_CAP: usize = 22;
+
+enum Prefix {
+    Inline { len: u8, data: [u8; INLINE_PREFIX_CAP] },
+    Heap(Box<[u8]>),
+}
+
+impl Prefix {
+    fn empty() -> Self {
+        Prefix::Inline { len: 0, data: [0; INLINE_PREFIX_CAP] }
+    }
+
+    fn from_slice(s: &[u8]) -> Self {
+        if s.len() <= INLINE_PREFIX_CAP {
+            let mut data = [0u8; INLINE_PREFIX_CAP];
+            data[..s.len()].copy_from_slice(s);
+            Prefix::Inline { len: s.len() as u8, data }
+        } else {
+            Prefix::Heap(Box::from(s))
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Prefix::Inline { len, data } => &data[..*len as usize],
+            Prefix::Heap(b) => b,
+        }
+    }
+}
+
+impl Default for Prefix {
+    fn default() -> Self { Prefix::empty() }
+}
+
+// ---------------------------------------------------------------------------
 // Node4
 // ---------------------------------------------------------------------------
 
 struct Node4<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 4],
@@ -228,7 +269,7 @@ struct Node4<V> {
 impl<V> Node4<V> {
     fn new() -> Self {
         Node4 {
-            prefix: Vec::new(),
+            prefix: Prefix::empty(),
             value: None,
             count: 0,
             keys: [0; 4],
@@ -671,7 +712,7 @@ fn push_range_children_rev<'a, V>(
 unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
     let ptr = node.inner_ptr();
     match node.kind() {
-        KIND_NODE4 => &(*(ptr as *const Node4<V>)).prefix,
+        KIND_NODE4 => (*(ptr as *const Node4<V>)).prefix.as_slice(),
         KIND_NODE16 => &(*(ptr as *const Node16<V>)).prefix,
         KIND_NODE48 => &(*(ptr as *const Node48<V>)).prefix,
         KIND_NODE256 => &(*(ptr as *const Node256<V>)).prefix,
@@ -841,12 +882,12 @@ fn inner_count<V>(node: &NodePtr<V>) -> usize {
     }
 }
 
-fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Vec<u8>) {
+fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Prefix) {
     match node.kind() {
         KIND_NODE4 => node.as_node4_mut().prefix = prefix,
-        KIND_NODE16 => node.as_node16_mut().prefix = prefix,
-        KIND_NODE48 => node.as_node48_mut().prefix = prefix,
-        KIND_NODE256 => node.as_node256_mut().prefix = prefix,
+        KIND_NODE16 => node.as_node16_mut().prefix = prefix.as_slice().to_vec(),
+        KIND_NODE48 => node.as_node48_mut().prefix = prefix.as_slice().to_vec(),
+        KIND_NODE256 => node.as_node256_mut().prefix = prefix.as_slice().to_vec(),
         _ => unreachable!(),
     }
 }
@@ -1107,13 +1148,13 @@ fn inner_clear_value<V>(node: &mut NodePtr<V>) -> InnerValue<V> {
     }
 }
 
-/// Get prefix, consuming it (replacing with empty vec).
-fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Vec<u8> {
+/// Get prefix, consuming it (replacing with empty).
+fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Prefix {
     match node.kind() {
         KIND_NODE4 => std::mem::take(&mut node.as_node4_mut().prefix),
-        KIND_NODE16 => std::mem::take(&mut node.as_node16_mut().prefix),
-        KIND_NODE48 => std::mem::take(&mut node.as_node48_mut().prefix),
-        KIND_NODE256 => std::mem::take(&mut node.as_node256_mut().prefix),
+        KIND_NODE16 => Prefix::from_slice(&std::mem::take(&mut node.as_node16_mut().prefix)),
+        KIND_NODE48 => Prefix::from_slice(&std::mem::take(&mut node.as_node48_mut().prefix)),
+        KIND_NODE256 => Prefix::from_slice(&std::mem::take(&mut node.as_node256_mut().prefix)),
         _ => unreachable!(),
     }
 }
@@ -1155,8 +1196,8 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
         let child_prefix = inner_take_prefix(&mut child);
         let mut merged = parent_prefix;
         merged.push(b);
-        merged.extend_from_slice(&child_prefix);
-        inner_set_prefix(&mut child, merged);
+        merged.extend_from_slice(child_prefix.as_slice());
+        inner_set_prefix(&mut child, Prefix::from_slice(&merged));
         return child;
     }
 
@@ -1295,7 +1336,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         let sd = depth + common; // split depth
 
         let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = key[depth..sd].to_vec();
+        nn.prefix = Prefix::from_slice(&key[depth..sd]);
 
         let mut nn_ptr = NodePtr::from_node4(nn);
 
@@ -1328,13 +1369,12 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
     if ml < plen {
         // Partial prefix match -> split this node
         let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = prefix[..ml].to_vec();
+        nn.prefix = Prefix::from_slice(&prefix[..ml]);
         let mut nn_ptr = NodePtr::from_node4(nn);
 
         // Update old node's prefix to suffix after split point
-        let new_prefix = prefix[ml + 1..].to_vec();
         let mut old_node = node;
-        inner_set_prefix(&mut old_node, new_prefix);
+        inner_set_prefix(&mut old_node, Prefix::from_slice(&prefix[ml + 1..]));
         inner_add_child(&mut nn_ptr, prefix[ml], old_node);
 
         let nd = depth + ml;
