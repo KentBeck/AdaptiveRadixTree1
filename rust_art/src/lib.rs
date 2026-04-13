@@ -200,7 +200,7 @@ impl<V> NodePtr<V> {
 // ---------------------------------------------------------------------------
 
 struct Leaf<V> {
-    key: Vec<u8>,
+    key: Box<[u8]>,
     value: V,
 }
 
@@ -363,7 +363,7 @@ impl<V> ARTMap<V> {
         while !node.is_null() {
             if node.is_leaf() {
                 let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-                if leaf.key == key {
+                if *leaf.key == *key {
                     return Some(&leaf.value);
                 }
                 return None;
@@ -1133,7 +1133,7 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
             // Free the inner node
             free_inner_node_shell(node);
             let (k, v) = val.unwrap();
-            return NodePtr::from_leaf(Box::new(Leaf { key: k, value: v }));
+            return NodePtr::from_leaf(Box::new(Leaf { key: k.into_boxed_slice(), value: v }));
         }
         // Totally empty — free and return null
         free_inner_node_shell(node);
@@ -1220,7 +1220,7 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
     }
 
     if node.is_leaf() {
-        if node.as_leaf().key == key {
+        if *node.as_leaf().key == *key {
             // Free the leaf
             drop(node.into_leaf_box());
             return (NodePtr::NULL, true);
@@ -1275,14 +1275,14 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
 fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool, V) {
     // Empty slot -> new leaf
     if node.is_null() {
-        let leaf = Box::new(Leaf { key: key.to_vec(), value });
+        let leaf = Box::new(Leaf { key: Box::from(key), value });
         return (NodePtr::from_leaf(leaf), true, unsafe { std::mem::zeroed() });
     }
 
     // Leaf
     if node.is_leaf() {
         let existing = node.as_leaf();
-        if existing.key == key {
+        if *existing.key == *key {
             // Update existing leaf
             let mut leaf_box = node.into_leaf_box();
             let old_value = std::mem::replace(&mut leaf_box.value, value);
@@ -1308,10 +1308,10 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
             let ekb_clone = ekb.to_vec();
             let existing_box = node.into_leaf_box();
             inner_set_value(&mut nn_ptr, ekb_clone, existing_box.value);
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[sd], NodePtr::from_leaf(new_leaf));
         } else {
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             // Add in sorted order
             let new_b = key[sd];
             let old_b = ekb[sd];
@@ -1342,7 +1342,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if nd == key.len() {
             inner_set_value(&mut nn_ptr, key.to_vec(), value);
         } else {
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[nd], NodePtr::from_leaf(new_leaf));
         }
         return (nn_ptr, true, unsafe { std::mem::zeroed() });
@@ -1367,7 +1367,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if inner_is_full(&node) {
             node = grow(node);
         }
-        let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+        let new_leaf = Box::new(Leaf { key: Box::from(key), value });
         inner_add_child(&mut node, b, NodePtr::from_leaf(new_leaf));
         return (node, true, unsafe { std::mem::zeroed() });
     }
