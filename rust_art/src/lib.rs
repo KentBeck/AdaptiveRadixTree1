@@ -307,7 +307,7 @@ impl<V> Node16<V> {
 // ---------------------------------------------------------------------------
 
 struct Node48<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     index: [u8; 256],       // byte -> slot index (0xFF = empty)
@@ -317,7 +317,7 @@ struct Node48<V> {
 impl<V> Node48<V> {
     fn new() -> Self {
         Node48 {
-            prefix: Vec::new(),
+            prefix: Prefix::empty(),
             value: None,
             count: 0,
             index: [0xFF; 256],
@@ -714,7 +714,7 @@ unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
     match node.kind() {
         KIND_NODE4 => (*(ptr as *const Node4<V>)).prefix.as_slice(),
         KIND_NODE16 => (*(ptr as *const Node16<V>)).prefix.as_slice(),
-        KIND_NODE48 => &(*(ptr as *const Node48<V>)).prefix,
+        KIND_NODE48 => (*(ptr as *const Node48<V>)).prefix.as_slice(),
         KIND_NODE256 => &(*(ptr as *const Node256<V>)).prefix,
         _ => unreachable!(),
     }
@@ -886,7 +886,7 @@ fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Prefix) {
     match node.kind() {
         KIND_NODE4 => node.as_node4_mut().prefix = prefix,
         KIND_NODE16 => node.as_node16_mut().prefix = prefix,
-        KIND_NODE48 => node.as_node48_mut().prefix = prefix.as_slice().to_vec(),
+        KIND_NODE48 => node.as_node48_mut().prefix = prefix,
         KIND_NODE256 => node.as_node256_mut().prefix = prefix.as_slice().to_vec(),
         _ => unreachable!(),
     }
@@ -1153,7 +1153,7 @@ fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Prefix {
     match node.kind() {
         KIND_NODE4 => std::mem::take(&mut node.as_node4_mut().prefix),
         KIND_NODE16 => std::mem::take(&mut node.as_node16_mut().prefix),
-        KIND_NODE48 => Prefix::from_slice(&std::mem::take(&mut node.as_node48_mut().prefix)),
+        KIND_NODE48 => std::mem::take(&mut node.as_node48_mut().prefix),
         KIND_NODE256 => Prefix::from_slice(&std::mem::take(&mut node.as_node256_mut().prefix)),
         _ => unreachable!(),
     }
