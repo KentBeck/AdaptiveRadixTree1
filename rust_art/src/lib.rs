@@ -4,7 +4,7 @@
 /// and adaptive node sizes (4, 16, 48, 256) for memory efficiency.
 /// Path compression collapses single-child chains into node prefixes.
 ///
-/// Keys are `Vec<u8>`, values are generic `V`.
+/// Keys are byte slices (`&[u8]`), values are generic `V`.
 
 // ---------------------------------------------------------------------------
 // Tagged pointer
@@ -200,7 +200,7 @@ impl<V> NodePtr<V> {
 // ---------------------------------------------------------------------------
 
 struct Leaf<V> {
-    key: Vec<u8>,
+    key: Box<[u8]>,
     value: V,
 }
 
@@ -211,14 +211,55 @@ struct Leaf<V> {
 // and children keyed by a single byte.
 
 /// Optional value on an inner node (when a key is a prefix of longer keys).
-type InnerValue<V> = Option<(Vec<u8>, V)>; // (full_key, value)
+type InnerValue<V> = Option<(Box<[u8]>, V)>; // (full_key, value)
+
+// ---------------------------------------------------------------------------
+// Inline prefix — avoids a heap allocation for short prefixes
+// ---------------------------------------------------------------------------
+// The Heap variant (Box<[u8]> fat pointer) forces this enum to 24 bytes.
+// We use all that space: 1 byte tag + 1 byte len + 22 bytes data = 24.
+// Prefixes up to 22 bytes are stored inline with zero heap allocation.
+
+const INLINE_PREFIX_CAP: usize = 22;
+
+enum Prefix {
+    Inline { len: u8, data: [u8; INLINE_PREFIX_CAP] },
+    Heap(Box<[u8]>),
+}
+
+impl Prefix {
+    fn empty() -> Self {
+        Prefix::Inline { len: 0, data: [0; INLINE_PREFIX_CAP] }
+    }
+
+    fn from_slice(s: &[u8]) -> Self {
+        if s.len() <= INLINE_PREFIX_CAP {
+            let mut data = [0u8; INLINE_PREFIX_CAP];
+            data[..s.len()].copy_from_slice(s);
+            Prefix::Inline { len: s.len() as u8, data }
+        } else {
+            Prefix::Heap(Box::from(s))
+        }
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Prefix::Inline { len, data } => &data[..*len as usize],
+            Prefix::Heap(b) => b,
+        }
+    }
+}
+
+impl Default for Prefix {
+    fn default() -> Self { Prefix::empty() }
+}
 
 // ---------------------------------------------------------------------------
 // Node4
 // ---------------------------------------------------------------------------
 
 struct Node4<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 4],
@@ -228,7 +269,7 @@ struct Node4<V> {
 impl<V> Node4<V> {
     fn new() -> Self {
         Node4 {
-            prefix: Vec::new(),
+            prefix: Prefix::empty(),
             value: None,
             count: 0,
             keys: [0; 4],
@@ -242,7 +283,7 @@ impl<V> Node4<V> {
 // ---------------------------------------------------------------------------
 
 struct Node16<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 16],
@@ -252,7 +293,7 @@ struct Node16<V> {
 impl<V> Node16<V> {
     fn new() -> Self {
         Node16 {
-            prefix: Vec::new(),
+            prefix: Prefix::empty(),
             value: None,
             count: 0,
             keys: [0; 16],
@@ -266,7 +307,7 @@ impl<V> Node16<V> {
 // ---------------------------------------------------------------------------
 
 struct Node48<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     index: [u8; 256],       // byte -> slot index (0xFF = empty)
@@ -276,7 +317,7 @@ struct Node48<V> {
 impl<V> Node48<V> {
     fn new() -> Self {
         Node48 {
-            prefix: Vec::new(),
+            prefix: Prefix::empty(),
             value: None,
             count: 0,
             index: [0xFF; 256],
@@ -290,7 +331,7 @@ impl<V> Node48<V> {
 // ---------------------------------------------------------------------------
 
 struct Node256<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u16,
     children: [NodePtr<V>; 256],
@@ -299,7 +340,7 @@ struct Node256<V> {
 impl<V> Node256<V> {
     fn new() -> Self {
         Node256 {
-            prefix: Vec::new(),
+            prefix: Prefix::empty(),
             value: None,
             count: 0,
             children: [NodePtr::NULL; 256],
@@ -363,7 +404,7 @@ impl<V> ARTMap<V> {
         while !node.is_null() {
             if node.is_leaf() {
                 let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-                if leaf.key == key {
+                if *leaf.key == *key {
                     return Some(&leaf.value);
                 }
                 return None;
@@ -449,7 +490,7 @@ impl<'a, V> Iterator for Iter<'a, V> {
             push_children_rev(node, &mut self.stack);
             // Yield own value if present
             if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                return Some((k.as_slice(), v));
+                return Some((k, v));
             }
         }
     }
@@ -560,7 +601,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                 if hi_avail == 0 {
                     // hi exhausted: only own value could match
                     if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                        let kb = k.as_slice();
+                        let kb = k;
                         if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
                             return Some((kb, v));
                         }
@@ -579,7 +620,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                     else {
                         // hi exhausted at nd; own value may match, children > hi
                         if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                            let kb = k.as_slice();
+                            let kb = k;
                             if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
                                 return Some((kb, v));
                             }
@@ -600,7 +641,7 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
 
             // Yield own value if in range
             if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                let kb = k.as_slice();
+                let kb = k;
                 if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
                     return Some((kb, v));
                 }
@@ -671,25 +712,25 @@ fn push_range_children_rev<'a, V>(
 unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
     let ptr = node.inner_ptr();
     match node.kind() {
-        KIND_NODE4 => &(*(ptr as *const Node4<V>)).prefix,
-        KIND_NODE16 => &(*(ptr as *const Node16<V>)).prefix,
-        KIND_NODE48 => &(*(ptr as *const Node48<V>)).prefix,
-        KIND_NODE256 => &(*(ptr as *const Node256<V>)).prefix,
+        KIND_NODE4 => (*(ptr as *const Node4<V>)).prefix.as_slice(),
+        KIND_NODE16 => (*(ptr as *const Node16<V>)).prefix.as_slice(),
+        KIND_NODE48 => (*(ptr as *const Node48<V>)).prefix.as_slice(),
+        KIND_NODE256 => (*(ptr as *const Node256<V>)).prefix.as_slice(),
         _ => unreachable!(),
     }
 }
 
 /// Get value stored on inner node. Caller must ensure node is valid.
-unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a Vec<u8>, &'a V)> {
+unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> {
     let ptr = node.inner_ptr();
-    let opt: &Option<(Vec<u8>, V)> = match node.kind() {
+    let opt: &Option<(Box<[u8]>, V)> = match node.kind() {
         KIND_NODE4 => &(*(ptr as *const Node4<V>)).value,
         KIND_NODE16 => &(*(ptr as *const Node16<V>)).value,
         KIND_NODE48 => &(*(ptr as *const Node48<V>)).value,
         KIND_NODE256 => &(*(ptr as *const Node256<V>)).value,
         _ => unreachable!(),
     };
-    opt.as_ref().map(|(k, v)| (k, v))
+    opt.as_ref().map(|(k, v)| (&**k, v))
 }
 
 /// Find child by byte key in inner node. Returns NULL if not found.
@@ -841,7 +882,7 @@ fn inner_count<V>(node: &NodePtr<V>) -> usize {
     }
 }
 
-fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Vec<u8>) {
+fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Prefix) {
     match node.kind() {
         KIND_NODE4 => node.as_node4_mut().prefix = prefix,
         KIND_NODE16 => node.as_node16_mut().prefix = prefix,
@@ -851,7 +892,7 @@ fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Vec<u8>) {
     }
 }
 
-fn inner_set_value<V>(node: &mut NodePtr<V>, key: Vec<u8>, value: V) {
+fn inner_set_value<V>(node: &mut NodePtr<V>, key: Box<[u8]>, value: V) {
     let val = Some((key, value));
     match node.kind() {
         KIND_NODE4 => node.as_node4_mut().value = val,
@@ -1107,8 +1148,8 @@ fn inner_clear_value<V>(node: &mut NodePtr<V>) -> InnerValue<V> {
     }
 }
 
-/// Get prefix, consuming it (replacing with empty vec).
-fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Vec<u8> {
+/// Get prefix, consuming it (replacing with empty).
+fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Prefix {
     match node.kind() {
         KIND_NODE4 => std::mem::take(&mut node.as_node4_mut().prefix),
         KIND_NODE16 => std::mem::take(&mut node.as_node16_mut().prefix),
@@ -1155,8 +1196,8 @@ fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
         let child_prefix = inner_take_prefix(&mut child);
         let mut merged = parent_prefix;
         merged.push(b);
-        merged.extend_from_slice(&child_prefix);
-        inner_set_prefix(&mut child, merged);
+        merged.extend_from_slice(child_prefix.as_slice());
+        inner_set_prefix(&mut child, Prefix::from_slice(&merged));
         return child;
     }
 
@@ -1220,7 +1261,7 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
     }
 
     if node.is_leaf() {
-        if node.as_leaf().key == key {
+        if *node.as_leaf().key == *key {
             // Free the leaf
             drop(node.into_leaf_box());
             return (NodePtr::NULL, true);
@@ -1275,14 +1316,14 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
 fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool, V) {
     // Empty slot -> new leaf
     if node.is_null() {
-        let leaf = Box::new(Leaf { key: key.to_vec(), value });
+        let leaf = Box::new(Leaf { key: Box::from(key), value });
         return (NodePtr::from_leaf(leaf), true, unsafe { std::mem::zeroed() });
     }
 
     // Leaf
     if node.is_leaf() {
         let existing = node.as_leaf();
-        if existing.key == key {
+        if *existing.key == *key {
             // Update existing leaf
             let mut leaf_box = node.into_leaf_box();
             let old_value = std::mem::replace(&mut leaf_box.value, value);
@@ -1295,23 +1336,22 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         let sd = depth + common; // split depth
 
         let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = key[depth..sd].to_vec();
+        nn.prefix = Prefix::from_slice(&key[depth..sd]);
 
         let mut nn_ptr = NodePtr::from_node4(nn);
 
         if sd == key.len() {
             // New key is prefix of existing
-            inner_set_value(&mut nn_ptr, key.to_vec(), value);
+            inner_set_value(&mut nn_ptr, Box::from(key), value);
             inner_add_child(&mut nn_ptr, ekb[sd], node);
         } else if sd == ekb.len() {
             // Existing key is prefix of new key
-            let ekb_clone = ekb.to_vec();
             let existing_box = node.into_leaf_box();
-            inner_set_value(&mut nn_ptr, ekb_clone, existing_box.value);
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+            inner_set_value(&mut nn_ptr, existing_box.key, existing_box.value);
+            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[sd], NodePtr::from_leaf(new_leaf));
         } else {
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             // Add in sorted order
             let new_b = key[sd];
             let old_b = ekb[sd];
@@ -1329,20 +1369,19 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
     if ml < plen {
         // Partial prefix match -> split this node
         let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = prefix[..ml].to_vec();
+        nn.prefix = Prefix::from_slice(&prefix[..ml]);
         let mut nn_ptr = NodePtr::from_node4(nn);
 
         // Update old node's prefix to suffix after split point
-        let new_prefix = prefix[ml + 1..].to_vec();
         let mut old_node = node;
-        inner_set_prefix(&mut old_node, new_prefix);
+        inner_set_prefix(&mut old_node, Prefix::from_slice(&prefix[ml + 1..]));
         inner_add_child(&mut nn_ptr, prefix[ml], old_node);
 
         let nd = depth + ml;
         if nd == key.len() {
-            inner_set_value(&mut nn_ptr, key.to_vec(), value);
+            inner_set_value(&mut nn_ptr, Box::from(key), value);
         } else {
-            let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[nd], NodePtr::from_leaf(new_leaf));
         }
         return (nn_ptr, true, unsafe { std::mem::zeroed() });
@@ -1355,7 +1394,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
     if nd == key.len() {
         // Key exhausted at this inner node - store value here
         let added = !inner_has_value(&node);
-        inner_set_value(&mut node, key.to_vec(), value);
+        inner_set_value(&mut node, Box::from(key), value);
         return (node, added, unsafe { std::mem::zeroed() });
     }
 
@@ -1367,7 +1406,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if inner_is_full(&node) {
             node = grow(node);
         }
-        let new_leaf = Box::new(Leaf { key: key.to_vec(), value });
+        let new_leaf = Box::new(Leaf { key: Box::from(key), value });
         inner_add_child(&mut node, b, NodePtr::from_leaf(new_leaf));
         return (node, true, unsafe { std::mem::zeroed() });
     }

@@ -80,11 +80,12 @@ reclaim ownership for deallocation.
 A leaf stores the full key and a value.  We keep the full key so that
 `get` can verify an exact match—the trie path only tells you the
 bytes consumed so far, and path compression means some bytes were
-skipped.
+skipped.  The key is a `Box<[u8]>` rather than a `Vec<u8>` because
+keys are write-once—the capacity field would be wasted.
 
 ```rust
 struct Leaf<V> {
-    key: Vec<u8>,
+    key: Box<[u8]>,
     value: V,
 }
 ```
@@ -93,18 +94,46 @@ struct Leaf<V> {
 
 Every inner node carries three things beyond its children:
 
-- **prefix**: a byte slice for path compression.  If a chain of nodes
-  each have exactly one child, we collapse them into a single node
-  whose prefix stores the skipped bytes.
-- **value**: an `Option<(Vec<u8>, V)>`.  When a key like `"ab"` is a
-  prefix of another key like `"abc"`, the value for `"ab"` lives on
-  the inner node at the branch point, not in a leaf.  The `Vec<u8>`
+- **prefix**: an inline `Prefix` for path compression (see below).
+  If a chain of nodes each have exactly one child, we collapse them
+  into a single node whose prefix stores the skipped bytes.
+- **value**: an `Option<(Box<[u8]>, V)>`.  When a key like `"ab"` is
+  a prefix of another key like `"abc"`, the value for `"ab"` lives on
+  the inner node at the branch point, not in a leaf.  The `Box<[u8]>`
   is the full key (for iteration and verification).
 - **count**: how many children are occupied.
 
 ```rust
-type InnerValue<V> = Option<(Vec<u8>, V)>;
+type InnerValue<V> = Option<(Box<[u8]>, V)>;
 ```
+
+### Inline prefix
+
+Every inner node has a path-compression prefix.  The first version
+stored it as `Vec<u8>`—24 bytes (pointer + length + capacity) plus a
+separate heap allocation for the actual bytes.  Since the prefix is
+read at every tree level during traversal, that extra pointer chase
+costs a cache miss per level.
+
+The fix is a small-buffer enum:
+
+```rust
+const INLINE_PREFIX_CAP: usize = 22;
+
+enum Prefix {
+    Inline { len: u8, data: [u8; INLINE_PREFIX_CAP] },
+    Heap(Box<[u8]>),
+}
+```
+
+The `Heap` variant (a `Box<[u8]>` fat pointer) forces this enum to
+24 bytes—the same size as the `Vec<u8>` it replaces.  We use all
+that space: 1 byte discriminant + 1 byte length + 22 bytes of inline
+data.  Prefixes up to 22 bytes live directly in the node struct with
+zero heap allocation; longer prefixes (rare in practice) fall back to
+a heap-allocated `Box<[u8]>`.  For the benchmark workload (keys like
+`key000000000000`), prefixes are typically 1–5 bytes and always fit
+inline.
 
 ### Node4
 
@@ -113,7 +142,7 @@ arrays.  Lookup is a linear scan.
 
 ```rust
 struct Node4<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 4],
@@ -128,7 +157,7 @@ binary search.
 
 ```rust
 struct Node16<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     keys: [u8; 16],
@@ -145,7 +174,7 @@ single index into the 48-slot array—O(1) regardless of child count.
 
 ```rust
 struct Node48<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u8,
     index: [u8; 256],       // byte → slot index (0xFF = empty)
@@ -160,7 +189,7 @@ single array access.
 
 ```rust
 struct Node256<V> {
-    prefix: Vec<u8>,
+    prefix: Prefix,
     value: InnerValue<V>,
     count: u16,
     children: [NodePtr<V>; 256],
@@ -424,10 +453,42 @@ behind chains of single-child nodes, degrading lookup performance.
 
 ## 8. Iteration
 
-The sorted iterator uses an explicit stack of `NodePtr` values.  When
-an inner node is popped, its children are pushed in reverse byte order
-(so the smallest byte ends up on top), and if the node carries a value
-it's yielded immediately.  Leaves are yielded directly.
+### First version: recursive collect
+
+The first iteration implementation used a recursive function that
+pushed every entry into a caller-supplied `Vec`:
+
+```rust
+unsafe fn iter_all<'a, V>(node: NodePtr<V>, out: &mut Vec<(&'a [u8], &'a V)>) {
+    if node.is_null() { return; }
+    if node.is_leaf() {
+        let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
+        out.push((&leaf.key, &leaf.value));
+        return;
+    }
+    if let Some((k, v)) = inner_value_raw(node) {
+        out.push((k.as_slice(), v));
+    }
+    for (_, child) in inner_children(&node) {
+        iter_all(child, out);
+    }
+}
+```
+
+This was simple but had two allocation costs: the output `Vec` grew to
+hold all n entries, and `inner_children` allocated a temporary `Vec` at
+every inner node to list its children.  At 10 million keys the
+iterate-all benchmark ran at 2.69x BTreeMap's time—the extra
+allocation traffic was measurable.
+
+### Optimization: lazy stack-based iterator
+
+The fix was to replace the recursive collect with a lazy `Iterator`
+that yields one entry at a time.  An explicit stack of `NodePtr`
+values replaces the call stack.  When an inner node is popped, its
+children are pushed in reverse byte order (so the smallest byte ends
+up on top), and if the node carries a value it's yielded immediately.
+Leaves are yielded directly.
 
 ```rust
 impl<'a, V> Iterator for Iter<'a, V> {
@@ -449,12 +510,16 @@ impl<'a, V> Iterator for Iter<'a, V> {
 }
 ```
 
-`push_children_rev` dispatches on node kind.  For Node4/Node16 it
-iterates the keys array in reverse; for Node48/Node256 it scans bytes
-255 down to 0.
+`push_children_rev` dispatches on node kind and writes directly to the
+stack—no temporary `Vec`.  For Node4/Node16 it iterates the keys array
+in reverse; for Node48/Node256 it scans bytes 255 down to 0.
 
 This approach costs O(tree height) stack space, never allocates an
 O(n) buffer, and does total O(n) work across all `next()` calls.
+
+The `items()` and `range()` convenience methods still return a `Vec`
+for callers that want a snapshot, but they now delegate to the lazy
+iterators rather than running their own recursive traversal.
 
 ---
 
@@ -577,6 +642,102 @@ memory scan that the hardware prefetcher loves.  ART iteration chases
 pointers across scattered heap allocations—each `Leaf` and inner node
 is a separate `Box`.  The 2x gap is the cost of pointer-chasing vs.
 cache-line scanning.
+
+### Performance tuning: lazy iterators
+
+The iteration numbers above reflect the optimized lazy iterator.  The
+original recursive `iter_all` function collected every entry into a
+`Vec`, and called `inner_children` (which itself allocates a `Vec`) at
+each inner node.  Those allocations added measurable overhead at scale.
+
+Replacing the recursive collect with the stack-based `Iter` and
+`RangeIter` (see section 8) cut iteration costs significantly at 10
+million keys:
+
+| Operation        | Before |  After | Improvement |
+|------------------|--------|--------|-------------|
+| Iterate all      |  2.69x |  2.06x |  23% faster |
+| Range query (1%) |  2.51x |  2.36x |   6% faster |
+
+The iterate-all improvement comes from eliminating the O(n) output
+`Vec` and the per-node temporary `Vec` from `inner_children`.  Range
+queries benefit less because their cost is dominated by boundary
+analysis at each level rather than allocation overhead.
+
+### Performance tuning: eliminating Vec from nodes
+
+The original implementation used `Vec<u8>` for three fields inside
+every node: the path-compression prefix in each inner node, the key in
+each leaf, and the key in each inner node value.  Each `Vec<u8>` costs
+24 bytes (pointer + length + capacity) plus a separate heap allocation
+for the data—even for a 3-byte prefix like `"key"`.
+
+We eliminated all `Vec<u8>` from the node types in three changes:
+
+1. **Leaf key and inner-value key: `Vec<u8>` → `Box<[u8]>`.**  Keys
+   are write-once, so the capacity field is wasted.  `Box<[u8]>` is
+   16 bytes instead of 24—saves 8 bytes per leaf.
+
+2. **Prefix: `Vec<u8>` → inline `Prefix` enum.**  Short prefixes
+   (≤ 22 bytes) are stored directly in the node struct with zero heap
+   allocation.  The enum is the same 24 bytes as the `Vec` it replaces,
+   so node struct sizes don't change—but the prefix bytes are now in
+   the same cache line as the node's other fields, eliminating one
+   pointer dereference per tree level during traversal.
+
+After these changes, the benchmark at 10 million keys:
+
+| Operation        |     ART |  BTreeMap | Ratio |
+|------------------|---------|-----------|-------|
+| Random put       | 15.505s |   23.963s | 0.65x |
+| Sequential put   |  3.667s |    4.548s | 0.81x |
+| Random get (hit) | 11.034s |   18.473s | 0.60x |
+| Random get (miss)|  0.121s |    1.804s | 0.07x |
+| Iterate all      |  0.605s |    0.324s | 1.87x |
+| Range query (1%) |  0.011s |    0.003s | 3.66x |
+| Random delete    | 15.665s |   18.552s | 0.84x |
+
+Iteration improved from 2.06x to 1.87x—the inline prefix means fewer
+cache misses when visiting each inner node.
+
+### Realistic key workloads
+
+The benchmarks above use a synthetic `key{i:012}` format—15-byte keys
+with a fixed 3-byte shared prefix.  That's a worst-case workload for
+ART's structural advantages: short keys mean BTreeMap's per-comparison
+cost is cheap, and short shared prefixes mean path compression barely
+helps.
+
+Real workloads tend to have longer keys with longer shared prefixes—
+URL paths, file paths, log-line keys.  Running the same operations at
+1 million keys across four key distributions shows the trend clearly
+(`cargo run --release --example bench_realistic`):
+
+| Workload       | Avg len | Put   | Get (hit) | Get (miss) | Iterate | Delete |
+|----------------|---------|-------|-----------|------------|---------|--------|
+| `key{:012}`    | 15 B    | 0.76x | 0.71x     | 0.05x      | 2.00x   | 1.05x  |
+| URL paths      | 38 B    | 0.85x | 0.69x     | 0.09x      | 2.23x   | 1.10x  |
+| File paths     | 54 B    | 0.62x | 0.68x     | 0.10x      | 2.23x   | 1.10x  |
+| Log lines      | 49 B    | 0.73x | 0.68x     | 0.09x      | 2.05x   | 0.70x  |
+
+Ratios are ART time / BTreeMap time; below 1.0 means ART is faster.
+
+As keys get longer, ART's advantage on point operations widens.  File
+paths show ART **38% faster on inserts** (0.62x) and **32% faster on
+lookups** (0.68x), because BTreeMap's O(key_length * log n) comparison
+cost grows with both key length and tree size, while ART walks the
+trie at O(key_length) regardless of n.
+
+Miss lookups stay around 0.09x–0.11x across all realistic workloads:
+ART rejects a miss at the first non-matching byte, which happens near
+the root for almost every miss, no matter how long the full key is.
+
+Iteration stays BTreeMap's territory (~2x faster) regardless of key
+length.  The inline prefix helps with iteration (section above) but
+can't overcome the fundamental disadvantage of pointer-chasing through
+scattered heap allocations versus scanning contiguous node arrays.
+
+### The fundamental trade-off
 
 This is the fundamental architectural trade-off: tries give O(key
 length) point operations by eliminating key comparisons, but pay for
