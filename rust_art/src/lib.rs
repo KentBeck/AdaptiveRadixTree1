@@ -374,7 +374,7 @@ impl<V> ARTMap<V> {
     }
 
     pub fn put(&mut self, key: &[u8], value: V) {
-        let (new_root, added, _) = put_recursive(self.root, key, value, 0);
+        let (new_root, added) = put_recursive(self.root, key, value, 0);
         self.root = new_root;
         if added {
             self.len += 1;
@@ -1313,11 +1313,11 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
 // ---------------------------------------------------------------------------
 
 /// Returns (new_node, was_new_key)
-fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool, V) {
+fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
     // Empty slot -> new leaf
     if node.is_null() {
         let leaf = Box::new(Leaf { key: Box::from(key), value });
-        return (NodePtr::from_leaf(leaf), true, unsafe { std::mem::zeroed() });
+        return (NodePtr::from_leaf(leaf), true);
     }
 
     // Leaf
@@ -1326,8 +1326,8 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if *existing.key == *key {
             // Update existing leaf
             let mut leaf_box = node.into_leaf_box();
-            let old_value = std::mem::replace(&mut leaf_box.value, value);
-            return (NodePtr::from_leaf(leaf_box), false, old_value);
+            leaf_box.value = value;
+            return (NodePtr::from_leaf(leaf_box), false);
         }
 
         // Mismatch: create Node4 to hold both
@@ -1358,7 +1358,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
             inner_add_child(&mut nn_ptr, new_b, NodePtr::from_leaf(new_leaf));
             inner_add_child(&mut nn_ptr, old_b, node);
         }
-        return (nn_ptr, true, unsafe { std::mem::zeroed() });
+        return (nn_ptr, true);
     }
 
     // Inner node
@@ -1384,7 +1384,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
             let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             inner_add_child(&mut nn_ptr, key[nd], NodePtr::from_leaf(new_leaf));
         }
-        return (nn_ptr, true, unsafe { std::mem::zeroed() });
+        return (nn_ptr, true);
     }
 
     // Full prefix match
@@ -1395,7 +1395,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         // Key exhausted at this inner node - store value here
         let added = !inner_has_value(&node);
         inner_set_value(&mut node, Box::from(key), value);
-        return (node, added, unsafe { std::mem::zeroed() });
+        return (node, added);
     }
 
     let b = key[nd];
@@ -1408,14 +1408,14 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         }
         let new_leaf = Box::new(Leaf { key: Box::from(key), value });
         inner_add_child(&mut node, b, NodePtr::from_leaf(new_leaf));
-        return (node, true, unsafe { std::mem::zeroed() });
+        return (node, true);
     }
 
-    let (new_child, added, old_v) = put_recursive(child, key, value, nd + 1);
+    let (new_child, added) = put_recursive(child, key, value, nd + 1);
     if new_child.0 != child.0 {
         inner_replace_child(&mut node, b, new_child);
     }
-    (node, added, old_v)
+    (node, added)
 }
 
 impl<V> Drop for ARTMap<V> {
