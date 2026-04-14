@@ -700,6 +700,43 @@ After these changes, the benchmark at 10 million keys:
 Iteration improved from 2.06x to 1.87x—the inline prefix means fewer
 cache misses when visiting each inner node.
 
+### Realistic key workloads
+
+The benchmarks above use a synthetic `key{i:012}` format—15-byte keys
+with a fixed 3-byte shared prefix.  That's a worst-case workload for
+ART's structural advantages: short keys mean BTreeMap's per-comparison
+cost is cheap, and short shared prefixes mean path compression barely
+helps.
+
+Real workloads tend to have longer keys with longer shared prefixes—
+URL paths, file paths, log-line keys.  Running the same operations at
+1 million keys across four key distributions shows the trend clearly
+(`cargo run --release --example bench_realistic`):
+
+| Workload       | Avg len | Put   | Get (hit) | Get (miss) | Iterate | Delete |
+|----------------|---------|-------|-----------|------------|---------|--------|
+| `key{:012}`    | 15 B    | 0.76x | 0.71x     | 0.05x      | 2.00x   | 1.05x  |
+| URL paths      | 38 B    | 0.85x | 0.69x     | 0.09x      | 2.23x   | 1.10x  |
+| File paths     | 54 B    | 0.62x | 0.68x     | 0.10x      | 2.23x   | 1.10x  |
+| Log lines      | 49 B    | 0.73x | 0.68x     | 0.09x      | 2.05x   | 0.70x  |
+
+Ratios are ART time / BTreeMap time; below 1.0 means ART is faster.
+
+As keys get longer, ART's advantage on point operations widens.  File
+paths show ART **38% faster on inserts** (0.62x) and **32% faster on
+lookups** (0.68x), because BTreeMap's O(key_length * log n) comparison
+cost grows with both key length and tree size, while ART walks the
+trie at O(key_length) regardless of n.
+
+Miss lookups stay around 0.09x–0.11x across all realistic workloads:
+ART rejects a miss at the first non-matching byte, which happens near
+the root for almost every miss, no matter how long the full key is.
+
+Iteration stays BTreeMap's territory (~2x faster) regardless of key
+length.  The inline prefix helps with iteration (section above) but
+can't overcome the fundamental disadvantage of pointer-chasing through
+scattered heap allocations versus scanning contiguous node arrays.
+
 ### The fundamental trade-off
 
 This is the fundamental architectural trade-off: tries give O(key
