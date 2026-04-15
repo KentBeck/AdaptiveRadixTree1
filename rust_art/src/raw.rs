@@ -203,6 +203,15 @@ impl<V> Leaf<V> {
     pub(crate) fn matches(&self, key: &[u8]) -> bool {
         *self.key == *key
     }
+
+    pub(crate) fn delete(node: NodePtr<V>, key: &[u8]) -> (NodePtr<V>, bool) {
+        if node.as_leaf().matches(key) {
+            drop(node.into_leaf_box());
+            (NodePtr::NULL, true)
+        } else {
+            (node, false)
+        }
+    }
 }
 
 pub(crate) type InnerValue<V> = Option<(Box<[u8]>, V)>;

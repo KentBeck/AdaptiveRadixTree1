@@ -111,11 +111,7 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
     }
 
     if node.is_leaf() {
-        if node.as_leaf().matches(key) {
-            drop(node.into_leaf_box());
-            return (NodePtr::NULL, true);
-        }
-        return (node, false);
+        return Leaf::delete(node, key);
     }
 
     let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
