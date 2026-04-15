@@ -28,6 +28,10 @@ impl<V> ARTMap<V> {
         self.len == 0
     }
 
+    pub fn get(&self, key: &[u8]) -> Option<&V> {
+        unsafe { self.get_inner(key) }
+    }
+
     pub fn put(&mut self, key: &[u8], value: V) {
         let (new_root, added) = put_recursive(self.root, key, value, 0);
         self.root = new_root;
@@ -43,10 +47,6 @@ impl<V> ARTMap<V> {
             self.len -= 1;
         }
         deleted
-    }
-
-    pub fn get(&self, key: &[u8]) -> Option<&V> {
-        unsafe { self.get_inner(key) }
     }
 
     unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
@@ -99,52 +99,6 @@ impl<V> ARTMap<V> {
     ) -> RangeIter<'a, V> {
         RangeIter::new(self.root, lo, hi)
     }
-}
-
-fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V>, bool) {
-    if node.is_null() {
-        return (NodePtr::NULL, false);
-    }
-
-    if node.is_leaf() {
-        return Leaf::delete(node, key);
-    }
-
-    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
-    let plen = prefix.len();
-    if key.len() < depth + plen || key[depth..depth + plen] != prefix[..] {
-        return (node, false);
-    }
-
-    let nd = depth + plen;
-    let mut node = node;
-
-    if nd == key.len() {
-        if !inner_has_value(&node) {
-            return (node, false);
-        }
-        inner_clear_value(&mut node);
-        return (compact(node), true);
-    }
-
-    let b = key[nd];
-    let child = inner_find(node, b);
-    if child.is_null() {
-        return (node, false);
-    }
-
-    let (new_child, deleted) = delete_recursive(child, key, nd + 1);
-    if !deleted {
-        return (node, false);
-    }
-
-    if new_child.is_null() {
-        inner_remove_child(&mut node, b);
-    } else {
-        inner_replace_child(&mut node, b, new_child);
-    }
-
-    (compact(node), true)
 }
 
 fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
@@ -203,6 +157,52 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         inner_replace_child(&mut node, b, new_child);
     }
     (node, added)
+}
+
+fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V>, bool) {
+    if node.is_null() {
+        return (NodePtr::NULL, false);
+    }
+
+    if node.is_leaf() {
+        return Leaf::delete(node, key);
+    }
+
+    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+    let plen = prefix.len();
+    if key.len() < depth + plen || key[depth..depth + plen] != prefix[..] {
+        return (node, false);
+    }
+
+    let nd = depth + plen;
+    let mut node = node;
+
+    if nd == key.len() {
+        if !inner_has_value(&node) {
+            return (node, false);
+        }
+        inner_clear_value(&mut node);
+        return (compact(node), true);
+    }
+
+    let b = key[nd];
+    let child = inner_find(node, b);
+    if child.is_null() {
+        return (node, false);
+    }
+
+    let (new_child, deleted) = delete_recursive(child, key, nd + 1);
+    if !deleted {
+        return (node, false);
+    }
+
+    if new_child.is_null() {
+        inner_remove_child(&mut node, b);
+    } else {
+        inner_replace_child(&mut node, b, new_child);
+    }
+
+    (compact(node), true)
 }
 
 impl<V> Drop for ARTMap<V> {
