@@ -18,9 +18,14 @@ use rust_art::ARTMap;
 struct Lcg(u64);
 
 impl Lcg {
-    fn new(seed: u64) -> Self { Lcg(seed) }
+    fn new(seed: u64) -> Self {
+        Lcg(seed)
+    }
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0
     }
     fn usize(&mut self, bound: usize) -> usize {
@@ -37,10 +42,22 @@ impl Lcg {
 /// URL-like keys: /api/v2/users/{id}/orders/{id}/items/{id}
 /// Shared prefixes are long (10-20 bytes), total keys 40-80 bytes.
 fn make_url_keys(n: usize) -> Vec<Vec<u8>> {
-    let services = ["users", "orders", "products", "inventory", "payments",
-                    "accounts", "sessions", "analytics", "notifications", "settings"];
-    let actions = ["list", "detail", "create", "update", "delete",
-                   "search", "export", "import", "validate", "archive"];
+    let services = [
+        "users",
+        "orders",
+        "products",
+        "inventory",
+        "payments",
+        "accounts",
+        "sessions",
+        "analytics",
+        "notifications",
+        "settings",
+    ];
+    let actions = [
+        "list", "detail", "create", "update", "delete", "search", "export", "import", "validate",
+        "archive",
+    ];
     let versions = ["v1", "v2", "v3"];
 
     let mut keys = Vec::with_capacity(n);
@@ -52,9 +69,7 @@ fn make_url_keys(n: usize) -> Vec<Vec<u8>> {
         let act = actions[(i / services.len()) % actions.len()];
         let id1 = i;
         let id2 = rng.usize(100_000);
-        let key = format!(
-            "/api/{ver}/{svc}/{id1:08x}/{act}/{id2:05}",
-        );
+        let key = format!("/api/{ver}/{svc}/{id1:08x}/{act}/{id2:05}",);
         keys.push(key.into_bytes());
     }
     keys
@@ -63,11 +78,35 @@ fn make_url_keys(n: usize) -> Vec<Vec<u8>> {
 /// File-path keys: /home/user/projects/project-N/src/module/file.ext
 /// Deep hierarchy, long shared prefixes (20-30 bytes).
 fn make_filepath_keys(n: usize) -> Vec<Vec<u8>> {
-    let projects = ["webapp", "backend", "cli-tools", "shared-lib", "infra",
-                    "data-pipeline", "ml-models", "docs", "tests", "scripts"];
-    let modules = ["auth", "api", "db", "cache", "config", "logging",
-                   "middleware", "handlers", "models", "utils",
-                   "services", "controllers", "views", "templates", "static"];
+    let projects = [
+        "webapp",
+        "backend",
+        "cli-tools",
+        "shared-lib",
+        "infra",
+        "data-pipeline",
+        "ml-models",
+        "docs",
+        "tests",
+        "scripts",
+    ];
+    let modules = [
+        "auth",
+        "api",
+        "db",
+        "cache",
+        "config",
+        "logging",
+        "middleware",
+        "handlers",
+        "models",
+        "utils",
+        "services",
+        "controllers",
+        "views",
+        "templates",
+        "static",
+    ];
     let extensions = ["rs", "toml", "json", "yaml", "md", "sql", "sh", "py"];
 
     let mut keys = Vec::with_capacity(n);
@@ -77,9 +116,7 @@ fn make_filepath_keys(n: usize) -> Vec<Vec<u8>> {
         let module = modules[(i / projects.len()) % modules.len()];
         let ext = extensions[(i / (projects.len() * modules.len())) % extensions.len()];
         let file_num = i;
-        let key = format!(
-            "/home/user/projects/{proj}/src/{module}/file_{file_num:06x}.{ext}",
-        );
+        let key = format!("/home/user/projects/{proj}/src/{module}/file_{file_num:06x}.{ext}",);
         keys.push(key.into_bytes());
     }
     keys
@@ -88,10 +125,22 @@ fn make_filepath_keys(n: usize) -> Vec<Vec<u8>> {
 /// Log-line keys: timestamp:host:service:level:request-id
 /// Very long keys (60-90 bytes), structured with colons.
 fn make_log_keys(n: usize) -> Vec<Vec<u8>> {
-    let hosts = ["web01", "web02", "web03", "api01", "api02",
-                 "db01", "db02", "cache01", "worker01", "worker02"];
-    let services = ["nginx", "app", "postgres", "redis", "celery",
-                    "prometheus", "grafana", "consul", "vault", "traefik"];
+    let hosts = [
+        "web01", "web02", "web03", "api01", "api02", "db01", "db02", "cache01", "worker01",
+        "worker02",
+    ];
+    let services = [
+        "nginx",
+        "app",
+        "postgres",
+        "redis",
+        "celery",
+        "prometheus",
+        "grafana",
+        "consul",
+        "vault",
+        "traefik",
+    ];
     let levels = ["DEBUG", "INFO", "WARN", "ERROR"];
 
     let mut keys = Vec::with_capacity(n);
@@ -103,9 +152,7 @@ fn make_log_keys(n: usize) -> Vec<Vec<u8>> {
         let svc = services[(i / hosts.len()) % services.len()];
         let level = levels[(i / (hosts.len() * services.len())) % levels.len()];
         let req_id = i;
-        let key = format!(
-            "{ts}:{host}:{svc}:{level}:req-{req_id:012x}",
-        );
+        let key = format!("{ts}:{host}:{svc}:{level}:req-{req_id:012x}",);
         keys.push(key.into_bytes());
     }
     keys
@@ -116,19 +163,33 @@ fn make_log_keys(n: usize) -> Vec<Vec<u8>> {
 // ---------------------------------------------------------------------------
 
 fn row(label: &str, t_art: f64, t_bt: f64) {
-    let ratio = if t_bt > 0.0 { t_art / t_bt } else { f64::INFINITY };
-    println!("{:<24}{:>11.3}s{:>11.3}s{:>9.2}x", label, t_art, t_bt, ratio);
+    let ratio = if t_bt > 0.0 {
+        t_art / t_bt
+    } else {
+        f64::INFINITY
+    };
+    println!(
+        "{:<24}{:>11.3}s{:>11.3}s{:>9.2}x",
+        label, t_art, t_bt, ratio
+    );
 }
 
 fn run_workload(name: &str, keys: &[Vec<u8>]) {
     let n = keys.len();
-    let header = format!("{:<24}{:>12}{:>12}{:>10}", "Operation", "ART", "BTreeMap", "Ratio");
+    let header = format!(
+        "{:<24}{:>12}{:>12}{:>10}",
+        "Operation", "ART", "BTreeMap", "Ratio"
+    );
     let sep = "-".repeat(header.len());
 
     println!();
     println!("{}", "=".repeat(header.len()));
-    println!("  {} ({} keys, avg len {} bytes)", name, format_with_commas(n),
-             keys.iter().map(|k| k.len()).sum::<usize>() / n);
+    println!(
+        "  {} ({} keys, avg len {} bytes)",
+        name,
+        format_with_commas(n),
+        keys.iter().map(|k| k.len()).sum::<usize>() / n
+    );
     println!("{}", "=".repeat(header.len()));
     println!("{}", header);
     println!("{}", sep);
@@ -192,7 +253,8 @@ fn run_workload(name: &str, keys: &[Vec<u8>]) {
     row("Random get (hit)", t_art, t_bt);
 
     // -- random get (miss): keys with same structure but different prefix --
-    let miss_keys: Vec<Vec<u8>> = keys.iter()
+    let miss_keys: Vec<Vec<u8>> = keys
+        .iter()
         .map(|k| {
             let mut m = b"MISS".to_vec();
             m.extend_from_slice(k);

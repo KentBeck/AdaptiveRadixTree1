@@ -5,9 +5,9 @@
 //! iterate all, 1% range query, random delete.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
-use rand::rngs::StdRng;
 use std::collections::BTreeMap;
 use std::time::Duration;
 

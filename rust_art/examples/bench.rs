@@ -15,7 +15,9 @@ fn make_keys(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     // Fisher-Yates with simple LCG for determinism
     let mut rng: u64 = 42;
     for i in (1..shuffled.len()).rev() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (rng >> 33) as usize % (i + 1);
         shuffled.swap(i, j);
     }
@@ -23,12 +25,22 @@ fn make_keys(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 }
 
 fn row(label: &str, t_art: f64, t_bt: f64) {
-    let ratio = if t_bt > 0.0 { t_art / t_bt } else { f64::INFINITY };
-    println!("{:<24}{:>11.3}s{:>11.3}s{:>9.2}x", label, t_art, t_bt, ratio);
+    let ratio = if t_bt > 0.0 {
+        t_art / t_bt
+    } else {
+        f64::INFINITY
+    };
+    println!(
+        "{:<24}{:>11.3}s{:>11.3}s{:>9.2}x",
+        label, t_art, t_bt, ratio
+    );
 }
 
 fn run(n: usize) {
-    let header = format!("{:<24}{:>12}{:>12}{:>10}", "Operation", "ART", "BTreeMap", "Ratio");
+    let header = format!(
+        "{:<24}{:>12}{:>12}{:>10}",
+        "Operation", "ART", "BTreeMap", "Ratio"
+    );
     let sep = "-".repeat(header.len());
 
     println!();
@@ -101,7 +113,9 @@ fn run(n: usize) {
     {
         let mut rng: u64 = 123;
         for i in (1..lookup.len()).rev() {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = (rng >> 33) as usize % (i + 1);
             lookup.swap(i, j);
         }
@@ -200,7 +214,9 @@ fn run(n: usize) {
     {
         let mut rng: u64 = 999;
         for i in (1..del_order.len()).rev() {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let j = (rng >> 33) as usize % (i + 1);
             del_order.swap(i, j);
         }

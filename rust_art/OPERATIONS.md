@@ -1,70 +1,142 @@
 # ART by Operation
 
-This is a second literate walkthrough of the same implementation described in
-[ART.md](ART.md).  That document follows the data structures top-down; this one
-follows the **operations**—what happens when you read, write, remove, or scan.
+This is the companion to [ART.md](ART.md). That document explains the data
+structures from the bottom up. This one explains the implementation the way a
+reader usually meets it in practice: **what happens when you call an
+operation**.
 
-All code below is copied from `src/lib.rs` (the crate root next to this file).
-If the implementation changes, refresh these excerpts to match.
+The code now lives across `src/map.rs`, `src/inner.rs`, `src/iter.rs`,
+`src/raw.rs`, and `src/prefix.rs`. The excerpts below are copied from those
+modules and arranged as a literate walkthrough of four operations:
+
+1. `get`
+2. `put`
+3. `delete`
+4. range scan
+
+The recurring idea is simple:
+
+- the tree is navigated one byte at a time,
+- path compression stores skipped bytes as an inline prefix on inner nodes,
+- a key that is also a prefix of longer keys stores its value on the inner node,
+- node shapes adapt as fanout grows and shrinks.
 
 ---
 
-## Get: one walk, three ideas
+## The public entry points
 
-`ARTMap::get` is a thin `unsafe` wrapper around `get_inner`.  The loop carries
-`depth` (how many bytes of the query key are already accounted for), compares each
-inner node’s path-compressed **prefix**, handles **prefix keys** stored on inner
-nodes when the query ends mid-route, then uses **`inner_find`** to follow the
-next branch byte.
-
-### Public entry and full walk
+All four operations start in `ARTMap<V>`:
 
 ```rust
 impl<V> ARTMap<V> {
+    pub fn put(&mut self, key: &[u8], value: V) {
+        let (new_root, added) = put_recursive(self.root, key, value, 0);
+        self.root = new_root;
+        if added {
+            self.len += 1;
+        }
+    }
+
+    pub fn delete(&mut self, key: &[u8]) -> bool {
+        let (new_root, deleted) = delete_recursive(self.root, key, 0);
+        self.root = new_root;
+        if deleted {
+            self.len -= 1;
+        }
+        deleted
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<&V> {
         unsafe { self.get_inner(key) }
     }
 
-    unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
-        let mut node = self.root;
-        let mut depth = 0;
+    pub fn range<'a>(
+        &'a self,
+        from_key: Option<&'a [u8]>,
+        to_key: Option<&'a [u8]>,
+    ) -> Vec<(&'a [u8], &'a V)> {
+        self.range_iter(from_key, to_key).collect()
+    }
 
-        while !node.is_null() {
-            if node.is_leaf() {
-                // Raw deref: returned refs must outlive the copied `NodePtr` local, not `as_leaf(&node)`.
-                let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-                if *leaf.key == *key {
-                    return Some(&leaf.value);
-                }
-                return None;
-            }
-
-            // Inner node: check prefix
-            let prefix = inner_prefix_raw(node);
-            let plen = prefix.len();
-            if key.len() < depth + plen || key[depth..depth + plen] != *prefix {
-                return None;
-            }
-            depth += plen;
-
-            if depth == key.len() {
-                // Key exhausted at this inner node
-                return inner_value_raw(node).map(|(_, v)| v);
-            }
-
-            let b = key[depth];
-            node = inner_find(node, b);
-            depth += 1;
-        }
-        None
+    pub fn range_iter<'a>(
+        &'a self,
+        lo: Option<&'a [u8]>,
+        hi: Option<&'a [u8]>,
+    ) -> RangeIter<'a, V> {
+        RangeIter::new(self.root, lo, hi)
     }
 }
 ```
 
-### Prefix bytes and prefix-key payload on inner nodes
+The public methods are deliberately thin. The interesting logic lives in the
+recursive walkers and the inner-node helpers.
+
+---
+
+## 1. Get
+
+Lookup is the cleanest operation, so it is the best place to learn the tree.
+
+The walk carries two pieces of state:
+
+- `node`: where we are in the tree,
+- `depth`: how many bytes of the key have already been consumed.
 
 ```rust
-unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
+unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
+    let mut node = self.root;
+    let mut depth = 0;
+
+    while !node.is_null() {
+        if node.is_leaf() {
+            let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
+            if *leaf.key == *key {
+                return Some(&leaf.value);
+            }
+            return None;
+        }
+
+        let prefix = inner_prefix_raw(node);
+        let plen = prefix.len();
+        if key.len() < depth + plen || key[depth..depth + plen] != *prefix {
+            return None;
+        }
+        depth += plen;
+
+        if depth == key.len() {
+            return crate::inner::inner_value_raw(node).map(|(_, value)| value);
+        }
+
+        let b = key[depth];
+        node = inner_find(node, b);
+        depth += 1;
+    }
+    None
+}
+```
+
+### Step 1: if we hit a leaf, verify the whole key
+
+ART navigation only gets us to a **candidate**. Because of path compression, the
+traversal knows that the bytes seen so far match, but it does not by itself
+prove full-key equality. So the leaf stores the whole key:
+
+```rust
+pub(crate) struct Leaf<V> {
+    pub(crate) key: Box<[u8]>,
+    pub(crate) value: V,
+}
+```
+
+That is why the leaf case does a final `leaf.key == key` check.
+
+### Step 2: if we hit an inner node, compare the compressed prefix
+
+Each inner node stores a prefix shared by every key in its subtree. Lookup must
+consume that prefix before it looks for the next branch byte:
+
+```rust
+pub(crate) unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
     let ptr = node.inner_ptr();
     match node.kind() {
         KIND_NODE4 => (*(ptr as *const Node4<V>)).prefix.as_slice(),
@@ -74,8 +146,14 @@ unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
         _ => unreachable!(),
     }
 }
+```
 
-unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> {
+If the query ends *exactly* at that inner node, the value may live there instead
+of in a leaf. That is how the tree represents keys like `ab` and `abc`
+simultaneously:
+
+```rust
+pub(crate) unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> {
     let ptr = node.inner_ptr();
     let opt: &Option<(Box<[u8]>, V)> = match node.kind() {
         KIND_NODE4 => &(*(ptr as *const Node4<V>)).value,
@@ -84,69 +162,17 @@ unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> 
         KIND_NODE256 => &(*(ptr as *const Node256<V>)).value,
         _ => unreachable!(),
     };
-    opt.as_ref().map(|(k, v)| (&**k, v))
+    opt.as_ref().map(|(key, value)| (&**key, value))
 }
 ```
 
-### Get at a leaf
+### Step 3: choose the child for the next byte
 
-A leaf stores the **full** key.  The walk only gets you to a candidate; you must
-compare `leaf.key == query`.  Returning `&V` uses a raw pointer derived from the
-tag-stripped bits so the borrow is not tied to the local `NodePtr` copy.
-
-```rust
-struct Leaf<V> {
-    key: Box<[u8]>,
-    value: V,
-}
-```
-
-The leaf case is the first arm of the `while` in `get_inner`.  Signature and
-body match `src/lib.rs` (the crate merges this with `get` in one `impl` block):
+All node shapes share the same logical operation — “find the child for byte
+`b`” — but each shape implements it differently:
 
 ```rust
-impl<V> ARTMap<V> {
-    unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
-        let mut node = self.root;
-        let mut depth = 0;
-
-        while !node.is_null() {
-            if node.is_leaf() {
-                let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-                if *leaf.key == *key {
-                    return Some(&leaf.value);
-                }
-                return None;
-            }
-
-            let prefix = inner_prefix_raw(node);
-            let plen = prefix.len();
-            if key.len() < depth + plen || key[depth..depth + plen] != *prefix {
-                return None;
-            }
-            depth += plen;
-
-            if depth == key.len() {
-                return inner_value_raw(node).map(|(_, v)| v);
-            }
-
-            let b = key[depth];
-            node = inner_find(node, b);
-            depth += 1;
-        }
-        None
-    }
-}
-```
-
-### Get at Node4, Node16, Node48, Node256 (`inner_find`)
-
-All four shapes share one dispatch.  **Node4:** linear scan up to four keys.
-**Node16:** `binary_search` on the used prefix of `keys`.  **Node48:** `index[b]`
-then `slots`.  **Node256:** direct `children[b]` (possibly null).
-
-```rust
-fn inner_find<V>(node: NodePtr<V>, b: u8) -> NodePtr<V> {
+pub(crate) fn inner_find<V>(node: NodePtr<V>, b: u8) -> NodePtr<V> {
     match node.kind() {
         KIND_NODE4 => {
             let n = node.as_node4();
@@ -174,40 +200,32 @@ fn inner_find<V>(node: NodePtr<V>, b: u8) -> NodePtr<V> {
                 n.slots[idx as usize]
             }
         }
-        KIND_NODE256 => {
-            let n = node.as_node256();
-            n.children[b as usize]
-        }
+        KIND_NODE256 => node.as_node256().children[b as usize],
         _ => unreachable!(),
     }
 }
 ```
 
+That is the whole lookup algorithm: validate prefix, maybe return the inner-node
+value, otherwise follow one byte to the next node.
+
 ---
 
-## Put: splits, prefix keys, growth
+## 2. Put
 
-### Public API
+Insertion is where the ART earns its keep. It must handle:
 
-```rust
-impl<V> ARTMap<V> {
-    pub fn put(&mut self, key: &[u8], value: V) {
-        let (new_root, added, _) = put_recursive(self.root, key, value, 0);
-        self.root = new_root;
-        if added {
-            self.len += 1;
-        }
-    }
-}
-```
+- adding into an empty slot,
+- overwriting an existing leaf,
+- splitting a leaf into a branching inner node,
+- splitting an inner node when a compressed prefix only partially matches,
+- storing values on inner nodes for prefix keys,
+- growing a node when it runs out of room.
 
-### Shared helper: first differing byte
-
-Used when splitting a leaf against an incoming key, and when comparing an inner
-prefix to the key.
+The key helper is “how far do these two byte slices agree?”:
 
 ```rust
-fn prefix_mismatch(a: &[u8], a_off: usize, b: &[u8], b_off: usize) -> usize {
+pub(crate) fn prefix_mismatch(a: &[u8], a_off: usize, b: &[u8], b_off: usize) -> usize {
     let n = (a.len() - a_off).min(b.len() - b_off);
     for i in 0..n {
         if a[a_off + i] != b[b_off + i] {
@@ -218,30 +236,40 @@ fn prefix_mismatch(a: &[u8], a_off: usize, b: &[u8], b_off: usize) -> usize {
 }
 ```
 
-### `put_recursive` (entire function)
+Before the recursive insert, the implementation names a tiny helper:
 
 ```rust
-fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool, V) {
-    // Empty slot -> new leaf
+fn leaf_ptr<V>(key: &[u8], value: V) -> NodePtr<V> {
+    NodePtr::from_leaf(Box::new(Leaf {
+        key: Box::from(key),
+        value,
+    }))
+}
+```
+
+That helper matters because insertion creates leaves in several branches. Giving
+that action a name makes the recursive logic read in terms of tree structure
+instead of allocation boilerplate.
+
+### The insertion walk
+
+```rust
+fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
     if node.is_null() {
-        let leaf = Box::new(Leaf { key: Box::from(key), value });
-        return (NodePtr::from_leaf(leaf), true, unsafe { std::mem::zeroed() });
+        return (leaf_ptr(key, value), true);
     }
 
-    // Leaf
     if node.is_leaf() {
         let existing = node.as_leaf();
         if *existing.key == *key {
-            // Update existing leaf
             let mut leaf_box = node.into_leaf_box();
-            let old_value = std::mem::replace(&mut leaf_box.value, value);
-            return (NodePtr::from_leaf(leaf_box), false, old_value);
+            leaf_box.value = value;
+            return (NodePtr::from_leaf(leaf_box), false);
         }
 
-        // Mismatch: create Node4 to hold both
-        let ekb = &existing.key;
-        let common = prefix_mismatch(key, depth, ekb, depth);
-        let sd = depth + common; // split depth
+        let existing_key = &existing.key;
+        let common = prefix_mismatch(key, depth, existing_key, depth);
+        let sd = depth + common;
 
         let mut nn = Box::new(Node4::<V>::new());
         nn.prefix = Prefix::from_slice(&key[depth..sd]);
@@ -249,32 +277,26 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         let mut nn_ptr = NodePtr::from_node4(nn);
 
         if sd == key.len() {
-            // New key is prefix of existing
             inner_set_value(&mut nn_ptr, Box::from(key), value);
-            inner_add_child(&mut nn_ptr, ekb[sd], node);
-        } else if sd == ekb.len() {
-            // Existing key is prefix of new key
+            inner_add_child(&mut nn_ptr, existing_key[sd], node);
+        } else if sd == existing_key.len() {
             let existing_box = node.into_leaf_box();
             inner_set_value(&mut nn_ptr, existing_box.key, existing_box.value);
-            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
-            inner_add_child(&mut nn_ptr, key[sd], NodePtr::from_leaf(new_leaf));
+            inner_add_child(&mut nn_ptr, key[sd], leaf_ptr(key, value));
         } else {
-            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
             let new_b = key[sd];
-            let old_b = ekb[sd];
-            inner_add_child(&mut nn_ptr, new_b, NodePtr::from_leaf(new_leaf));
+            let old_b = existing_key[sd];
+            inner_add_child(&mut nn_ptr, new_b, leaf_ptr(key, value));
             inner_add_child(&mut nn_ptr, old_b, node);
         }
-        return (nn_ptr, true, unsafe { std::mem::zeroed() });
+        return (nn_ptr, true);
     }
 
-    // Inner node
     let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
     let plen = prefix.len();
     let ml = prefix_mismatch(key, depth, &prefix, 0);
 
     if ml < plen {
-        // Partial prefix match -> split this node
         let mut nn = Box::new(Node4::<V>::new());
         nn.prefix = Prefix::from_slice(&prefix[..ml]);
         let mut nn_ptr = NodePtr::from_node4(nn);
@@ -287,20 +309,18 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if nd == key.len() {
             inner_set_value(&mut nn_ptr, Box::from(key), value);
         } else {
-            let new_leaf = Box::new(Leaf { key: Box::from(key), value });
-            inner_add_child(&mut nn_ptr, key[nd], NodePtr::from_leaf(new_leaf));
+            inner_add_child(&mut nn_ptr, key[nd], leaf_ptr(key, value));
         }
-        return (nn_ptr, true, unsafe { std::mem::zeroed() });
+        return (nn_ptr, true);
     }
 
-    // Full prefix match
     let nd = depth + plen;
     let mut node = node;
 
     if nd == key.len() {
         let added = !inner_has_value(&node);
         inner_set_value(&mut node, Box::from(key), value);
-        return (node, added, unsafe { std::mem::zeroed() });
+        return (node, added);
     }
 
     let b = key[nd];
@@ -310,154 +330,62 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if inner_is_full(&node) {
             node = grow(node);
         }
-        let new_leaf = Box::new(Leaf { key: Box::from(key), value });
-        inner_add_child(&mut node, b, NodePtr::from_leaf(new_leaf));
-        return (node, true, unsafe { std::mem::zeroed() });
+        inner_add_child(&mut node, b, leaf_ptr(key, value));
+        return (node, true);
     }
 
-    let (new_child, added, old_v) = put_recursive(child, key, value, nd + 1);
+    let (new_child, added) = put_recursive(child, key, value, nd + 1);
     if new_child.0 != child.0 {
         inner_replace_child(&mut node, b, new_child);
     }
-    (node, added, old_v)
+    (node, added)
 }
 ```
 
-### Mutations `put` relies on
+### Case A: empty slot -> leaf
+
+This is the base case. No subtree exists, so insertion allocates a new leaf and
+returns it.
+
+### Case B: leaf -> overwrite or split
+
+If the keys are identical, insertion is just an overwrite.
+
+One simplification worth calling out: `put_recursive` now returns only
+`(new_node, added)`. The earlier version carried an extra `V` back up the stack
+even though `ARTMap::put` never used it. Removing that dead value made the code
+match the real question insertion is answering: **did the subtree root change,
+and did the map grow?**
+
+If they differ, one leaf is no longer enough. The code allocates a `Node4`,
+stores the common bytes as its prefix, and then handles one of three subcases:
+
+1. the **new key** is a prefix of the old key,
+2. the **old key** is a prefix of the new key,
+3. neither key is a prefix; they simply branch at the split byte.
+
+That is the first important design move in the implementation: **branch points
+become inner nodes, and prefix keys live on those nodes**.
+
+### Case C: inner node -> prefix split or descend
+
+If the incoming key only partially matches the node’s compressed prefix, the
+node itself must be split. The existing node keeps the unmatched suffix of the
+old prefix; a fresh `Node4` becomes the new parent and holds the common prefix.
+
+If the full prefix matches, insertion either:
+
+- stores a value on the current node (when the key ends here),
+- adds a new child leaf (when no child exists for the next byte),
+- or recurses into the existing child.
+
+### Growing nodes
+
+When an inner node is full, insertion promotes it to the next shape before
+adding the new child:
 
 ```rust
-fn inner_set_value<V>(node: &mut NodePtr<V>, key: Box<[u8]>, value: V) {
-    let val = Some((key, value));
-    match node.kind() {
-        KIND_NODE4 => node.as_node4_mut().value = val,
-        KIND_NODE16 => node.as_node16_mut().value = val,
-        KIND_NODE48 => node.as_node48_mut().value = val,
-        KIND_NODE256 => node.as_node256_mut().value = val,
-        _ => unreachable!(),
-    }
-}
-
-fn inner_set_prefix<V>(node: &mut NodePtr<V>, prefix: Prefix) {
-    match node.kind() {
-        KIND_NODE4 => node.as_node4_mut().prefix = prefix,
-        KIND_NODE16 => node.as_node16_mut().prefix = prefix,
-        KIND_NODE48 => node.as_node48_mut().prefix = prefix,
-        KIND_NODE256 => node.as_node256_mut().prefix = prefix,
-        _ => unreachable!(),
-    }
-}
-
-fn inner_has_value<V>(node: &NodePtr<V>) -> bool {
-    match node.kind() {
-        KIND_NODE4 => node.as_node4().value.is_some(),
-        KIND_NODE16 => node.as_node16().value.is_some(),
-        KIND_NODE48 => node.as_node48().value.is_some(),
-        KIND_NODE256 => node.as_node256().value.is_some(),
-        _ => unreachable!(),
-    }
-}
-
-fn inner_is_full<V>(node: &NodePtr<V>) -> bool {
-    match node.kind() {
-        KIND_NODE4 => node.as_node4().count >= 4,
-        KIND_NODE16 => node.as_node16().count >= 16,
-        KIND_NODE48 => node.as_node48().count >= 48,
-        KIND_NODE256 => false,
-        _ => unreachable!(),
-    }
-}
-
-fn inner_add_child<V>(node: &mut NodePtr<V>, b: u8, child: NodePtr<V>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4_mut();
-            let cnt = n.count as usize;
-            let pos = n.keys[..cnt].iter().position(|&k| k > b).unwrap_or(cnt);
-            for i in (pos..cnt).rev() {
-                n.keys[i + 1] = n.keys[i];
-                n.children[i + 1] = n.children[i];
-            }
-            n.keys[pos] = b;
-            n.children[pos] = child;
-            n.count += 1;
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16_mut();
-            let cnt = n.count as usize;
-            let pos = n.keys[..cnt].iter().position(|&k| k > b).unwrap_or(cnt);
-            for i in (pos..cnt).rev() {
-                n.keys[i + 1] = n.keys[i];
-                n.children[i + 1] = n.children[i];
-            }
-            n.keys[pos] = b;
-            n.children[pos] = child;
-            n.count += 1;
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48_mut();
-            let slot = (0u8..48).find(|&j| n.slots[j as usize].is_null()).unwrap();
-            n.index[b as usize] = slot;
-            n.slots[slot as usize] = child;
-            n.count += 1;
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256_mut();
-            n.children[b as usize] = child;
-            n.count += 1;
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn inner_replace_child<V>(node: &mut NodePtr<V>, b: u8, child: NodePtr<V>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4_mut();
-            for i in 0..n.count as usize {
-                if n.keys[i] == b {
-                    n.children[i] = child;
-                    return;
-                }
-            }
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16_mut();
-            let cnt = n.count as usize;
-            if let Ok(i) = n.keys[..cnt].binary_search(&b) {
-                n.children[i] = child;
-            }
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48_mut();
-            let idx = n.index[b as usize];
-            n.slots[idx as usize] = child;
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256_mut();
-            n.children[b as usize] = child;
-        }
-        _ => unreachable!(),
-    }
-}
-```
-
-### Node growth (4 → 16 → 48 → 256)
-
-```rust
-fn inner_move_header<V>(src: &mut NodePtr<V>, dst: &mut NodePtr<V>) {
-    let prefix = inner_take_prefix(src);
-    let value = inner_clear_value(src);
-    inner_set_prefix(dst, prefix);
-    match dst.kind() {
-        KIND_NODE4 => dst.as_node4_mut().value = value,
-        KIND_NODE16 => dst.as_node16_mut().value = value,
-        KIND_NODE48 => dst.as_node48_mut().value = value,
-        KIND_NODE256 => dst.as_node256_mut().value = value,
-        _ => unreachable!(),
-    }
-}
-
-fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+pub(crate) fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
     match node.kind() {
         KIND_NODE4 => {
             let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
@@ -514,40 +442,201 @@ fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
 }
 ```
 
-`grow` ends each arm with `free_inner_node_shell` (defined under **Delete** below)
-so the old node’s `Box` is dropped without recursively dropping children that were
-moved to the new node.
+The header move is important: growth keeps the **prefix** and the optional
+**inner-node value** intact while only changing the child representation.
 
-Headers move during `grow` / `shrink` without double-dropping children:
+---
+
+## 3. Delete
+
+Deletion mirrors insertion in the forward direction, then does extra work on
+the way back up to keep the tree compact.
 
 ```rust
-type InnerValue<V> = Option<(Box<[u8]>, V)>;
-
-fn inner_clear_value<V>(node: &mut NodePtr<V>) -> InnerValue<V> {
-    match node.kind() {
-        KIND_NODE4 => node.as_node4_mut().value.take(),
-        KIND_NODE16 => node.as_node16_mut().value.take(),
-        KIND_NODE48 => node.as_node48_mut().value.take(),
-        KIND_NODE256 => node.as_node256_mut().value.take(),
-        _ => unreachable!(),
+fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V>, bool) {
+    if node.is_null() {
+        return (NodePtr::NULL, false);
     }
-}
 
-fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Prefix {
+    if node.is_leaf() {
+        if *node.as_leaf().key == *key {
+            drop(node.into_leaf_box());
+            return (NodePtr::NULL, true);
+        }
+        return (node, false);
+    }
+
+    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+    let plen = prefix.len();
+    if key.len() < depth + plen || key[depth..depth + plen] != prefix[..] {
+        return (node, false);
+    }
+
+    let nd = depth + plen;
+    let mut node = node;
+
+    if nd == key.len() {
+        if !inner_has_value(&node) {
+            return (node, false);
+        }
+        inner_clear_value(&mut node);
+        return (compact(node), true);
+    }
+
+    let b = key[nd];
+    let child = inner_find(node, b);
+    if child.is_null() {
+        return (node, false);
+    }
+
+    let (new_child, deleted) = delete_recursive(child, key, nd + 1);
+    if !deleted {
+        return (node, false);
+    }
+
+    if new_child.is_null() {
+        inner_remove_child(&mut node, b);
+    } else {
+        inner_replace_child(&mut node, b, new_child);
+    }
+
+    (compact(node), true)
+}
+```
+
+### The forward walk
+
+The forward half is straightforward:
+
+- `NULL` means “not found,”
+- a leaf is deleted only on exact key match,
+- an inner node must match its compressed prefix before we descend,
+- if the key ends exactly at an inner node, deletion clears the stored prefix
+  value instead of removing a child.
+
+### Removing a child
+
+Once a recursive delete succeeds, the parent either removes the child slot or
+replaces it with a compacted child pointer:
+
+```rust
+pub(crate) fn inner_remove_child<V>(node: &mut NodePtr<V>, b: u8) {
     match node.kind() {
-        KIND_NODE4 => std::mem::take(&mut node.as_node4_mut().prefix),
-        KIND_NODE16 => std::mem::take(&mut node.as_node16_mut().prefix),
-        KIND_NODE48 => std::mem::take(&mut node.as_node48_mut().prefix),
-        KIND_NODE256 => std::mem::take(&mut node.as_node256_mut().prefix),
+        KIND_NODE4 => {
+            let n = node.as_node4_mut();
+            let cnt = n.count as usize;
+            if let Some(pos) = n.keys[..cnt].iter().position(|&k| k == b) {
+                for i in pos..cnt - 1 {
+                    n.keys[i] = n.keys[i + 1];
+                    n.children[i] = n.children[i + 1];
+                }
+                n.children[cnt - 1] = NodePtr::NULL;
+                n.count -= 1;
+            }
+        }
+        KIND_NODE16 => {
+            let n = node.as_node16_mut();
+            let cnt = n.count as usize;
+            if let Ok(pos) = n.keys[..cnt].binary_search(&b) {
+                for i in pos..cnt - 1 {
+                    n.keys[i] = n.keys[i + 1];
+                    n.children[i] = n.children[i + 1];
+                }
+                n.children[cnt - 1] = NodePtr::NULL;
+                n.count -= 1;
+            }
+        }
+        KIND_NODE48 => {
+            let n = node.as_node48_mut();
+            let idx = n.index[b as usize];
+            if idx != 0xFF {
+                n.slots[idx as usize] = NodePtr::NULL;
+                n.index[b as usize] = 0xFF;
+                n.count -= 1;
+            }
+        }
+        KIND_NODE256 => {
+            let n = node.as_node256_mut();
+            if !n.children[b as usize].is_null() {
+                n.children[b as usize] = NodePtr::NULL;
+                n.count -= 1;
+            }
+        }
         _ => unreachable!(),
     }
 }
 ```
 
-### Shrink (256 → 48 → 16 → 4), mirror of `grow`
+### Compaction
+
+The crucial cleanup step is `compact`:
 
 ```rust
-fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+pub(crate) fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+    let count = inner_count(&node);
+
+    if count == 0 {
+        if inner_has_value(&node) {
+            let val = inner_clear_value(&mut node);
+            free_inner_node_shell(node);
+            let (key, value) = val.unwrap();
+            return NodePtr::from_leaf(Box::new(Leaf { key, value }));
+        }
+        free_inner_node_shell(node);
+        return NodePtr::NULL;
+    }
+
+    if count == 1 && !inner_has_value(&node) {
+        let children = inner_children(&node);
+        let (b, child) = children[0];
+        if child.is_leaf() {
+            free_inner_node_shell(node);
+            return child;
+        }
+        let parent_prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+        free_inner_node_shell(node);
+        let mut child = child;
+        let child_prefix = inner_take_prefix(&mut child);
+        let mut merged = parent_prefix;
+        merged.push(b);
+        merged.extend_from_slice(child_prefix.as_slice());
+        inner_set_prefix(&mut child, Prefix::from_slice(&merged));
+        return child;
+    }
+
+    let should_shrink = match node.kind() {
+        KIND_NODE256 => count <= 48,
+        KIND_NODE48 => count <= 16,
+        KIND_NODE16 => count <= 4,
+        _ => false,
+    };
+    if should_shrink {
+        return shrink(node);
+    }
+
+    node
+}
+```
+
+`compact` handles three structural repairs:
+
+1. **no children left**  
+   If the node still has its own value, it becomes a leaf. Otherwise it becomes
+   null.
+
+2. **exactly one child and no own value**  
+   The node is redundant. If the child is a leaf, we return it directly. If the
+   child is another inner node, we merge:
+
+   `parent.prefix + branch_byte + child.prefix`
+
+3. **too sparse for its current shape**  
+   The node shrinks to the next smaller representation.
+
+Shrinkage is the inverse of growth:
+
+```rust
+pub(crate) fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
     match node.kind() {
         KIND_NODE256 => {
             let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
@@ -607,357 +696,24 @@ fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
 }
 ```
 
----
-
-## Delete: recurse, strip, compact
-
-### Public API
-
-```rust
-impl<V> ARTMap<V> {
-    pub fn delete(&mut self, key: &[u8]) -> bool {
-        let (new_root, deleted) = delete_recursive(self.root, key, 0);
-        self.root = new_root;
-        if deleted {
-            self.len -= 1;
-        }
-        deleted
-    }
-}
-```
-
-### `delete_recursive`
-
-```rust
-fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V>, bool) {
-    if node.is_null() {
-        return (NodePtr::NULL, false);
-    }
-
-    if node.is_leaf() {
-        if *node.as_leaf().key == *key {
-            drop(node.into_leaf_box());
-            return (NodePtr::NULL, true);
-        }
-        return (node, false);
-    }
-
-    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
-    let plen = prefix.len();
-    if key.len() < depth + plen || key[depth..depth + plen] != prefix[..] {
-        return (node, false);
-    }
-
-    let nd = depth + plen;
-    let mut node = node;
-
-    if nd == key.len() {
-        if !inner_has_value(&node) {
-            return (node, false);
-        }
-        inner_clear_value(&mut node);
-        return (compact(node), true);
-    }
-
-    let b = key[nd];
-    let child = inner_find(node, b);
-    if child.is_null() {
-        return (node, false);
-    }
-
-    let (new_child, deleted) = delete_recursive(child, key, nd + 1);
-    if !deleted {
-        return (node, false);
-    }
-
-    if new_child.is_null() {
-        inner_remove_child(&mut node, b);
-    } else {
-        inner_replace_child(&mut node, b, new_child);
-    }
-
-    (compact(node), true)
-}
-```
-
-### Remove child edge
-
-```rust
-fn inner_remove_child<V>(node: &mut NodePtr<V>, b: u8) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4_mut();
-            let cnt = n.count as usize;
-            if let Some(pos) = n.keys[..cnt].iter().position(|&k| k == b) {
-                for i in pos..cnt - 1 {
-                    n.keys[i] = n.keys[i + 1];
-                    n.children[i] = n.children[i + 1];
-                }
-                n.children[cnt - 1] = NodePtr::NULL;
-                n.count -= 1;
-            }
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16_mut();
-            let cnt = n.count as usize;
-            if let Ok(pos) = n.keys[..cnt].binary_search(&b) {
-                for i in pos..cnt - 1 {
-                    n.keys[i] = n.keys[i + 1];
-                    n.children[i] = n.children[i + 1];
-                }
-                n.children[cnt - 1] = NodePtr::NULL;
-                n.count -= 1;
-            }
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48_mut();
-            let idx = n.index[b as usize];
-            if idx != 0xFF {
-                n.slots[idx as usize] = NodePtr::NULL;
-                n.index[b as usize] = 0xFF;
-                n.count -= 1;
-            }
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256_mut();
-            if !n.children[b as usize].is_null() {
-                n.children[b as usize] = NodePtr::NULL;
-                n.count -= 1;
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-```
-
-### `compact` and freeing the inner shell
-
-```rust
-fn inner_count<V>(node: &NodePtr<V>) -> usize {
-    match node.kind() {
-        KIND_NODE4 => node.as_node4().count as usize,
-        KIND_NODE16 => node.as_node16().count as usize,
-        KIND_NODE48 => node.as_node48().count as usize,
-        KIND_NODE256 => node.as_node256().count as usize,
-        _ => unreachable!(),
-    }
-}
-
-fn inner_children<V>(node: &NodePtr<V>) -> Vec<(u8, NodePtr<V>)> {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4();
-            let cnt = n.count as usize;
-            (0..cnt).map(|i| (n.keys[i], n.children[i])).collect()
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16();
-            let cnt = n.count as usize;
-            (0..cnt).map(|i| (n.keys[i], n.children[i])).collect()
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48();
-            let mut out = Vec::new();
-            for b in 0..256usize {
-                let idx = n.index[b];
-                if idx != 0xFF {
-                    out.push((b as u8, n.slots[idx as usize]));
-                }
-            }
-            out
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256();
-            let mut out = Vec::new();
-            for b in 0..256usize {
-                if !n.children[b].is_null() {
-                    out.push((b as u8, n.children[b]));
-                }
-            }
-            out
-        }
-        _ => unreachable!(),
-    }
-}
-
-fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
-    let count = inner_count(&node);
-
-    if count == 0 {
-        if inner_has_value(&node) {
-            let val = inner_clear_value(&mut node);
-            free_inner_node_shell(node);
-            let (k, v) = val.unwrap();
-            return NodePtr::from_leaf(Box::new(Leaf { key: k, value: v }));
-        }
-        free_inner_node_shell(node);
-        return NodePtr::NULL;
-    }
-
-    if count == 1 && !inner_has_value(&node) {
-        let children = inner_children(&node);
-        let (b, child) = children[0];
-        if child.is_leaf() {
-            free_inner_node_shell(node);
-            return child;
-        }
-        let parent_prefix = unsafe { inner_prefix_raw(node) }.to_vec();
-        free_inner_node_shell(node);
-        let mut child = child;
-        let child_prefix = inner_take_prefix(&mut child);
-        let mut merged = parent_prefix;
-        merged.push(b);
-        merged.extend_from_slice(child_prefix.as_slice());
-        inner_set_prefix(&mut child, Prefix::from_slice(&merged));
-        return child;
-    }
-
-    let should_shrink = match node.kind() {
-        KIND_NODE256 => count <= 48,
-        KIND_NODE48 => count <= 16,
-        KIND_NODE16 => count <= 4,
-        _ => false,
-    };
-    if should_shrink {
-        return shrink(node);
-    }
-
-    node
-}
-
-fn free_inner_node_shell<V>(node: NodePtr<V>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let mut b = node.into_node4_box();
-            b.count = 0;
-            b.value = None;
-            drop(b);
-        }
-        KIND_NODE16 => {
-            let mut b = node.into_node16_box();
-            b.count = 0;
-            b.value = None;
-            drop(b);
-        }
-        KIND_NODE48 => {
-            let mut b = node.into_node48_box();
-            b.count = 0;
-            b.value = None;
-            b.index = [0xFF; 256];
-            drop(b);
-        }
-        KIND_NODE256 => {
-            let mut b = node.into_node256_box();
-            b.count = 0;
-            b.value = None;
-            for c in b.children.iter_mut() {
-                *c = NodePtr::NULL;
-            }
-            drop(b);
-        }
-        _ => unreachable!(),
-    }
-}
-```
+Insertion expands the tree just enough; deletion compresses it again.
 
 ---
 
-## Full scan iteration (`iter`)
+## 4. Range scan
 
-Lazy DFS via an explicit stack; children are pushed high-to-low so the smallest
-byte is popped first.
+The range scan is the most subtle operation. A full in-order walk is easy; the
+challenge is to skip entire subtrees that are known to be outside the bounds.
 
-```rust
-impl<V> ARTMap<V> {
-    pub fn iter(&self) -> Iter<'_, V> {
-        let mut stack = Vec::new();
-        if !self.root.is_null() {
-            stack.push(self.root);
-        }
-        Iter { stack, _marker: std::marker::PhantomData }
-    }
-}
+The public API has two forms:
 
-pub struct Iter<'a, V> {
-    stack: Vec<NodePtr<V>>,
-    _marker: std::marker::PhantomData<&'a V>,
-}
+- `range(lo, hi)`, which collects into a `Vec`,
+- `range_iter(lo, hi)`, which yields lazily.
 
-impl<'a, V> Iterator for Iter<'a, V> {
-    type Item = (&'a [u8], &'a V);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let node = self.stack.pop()?;
-            if node.is_leaf() {
-                let leaf = unsafe { &*((node.0 & !TAG_MASK) as *const Leaf<V>) };
-                return Some((&leaf.key, &leaf.value));
-            }
-            push_children_rev(node, &mut self.stack);
-            if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                return Some((k, v));
-            }
-        }
-    }
-}
-
-fn push_children_rev<V>(node: NodePtr<V>, stack: &mut Vec<NodePtr<V>>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4();
-            for i in (0..n.count as usize).rev() {
-                stack.push(n.children[i]);
-            }
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16();
-            for i in (0..n.count as usize).rev() {
-                stack.push(n.children[i]);
-            }
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48();
-            for b in (0..256usize).rev() {
-                if n.index[b] != 0xFF {
-                    stack.push(n.slots[n.index[b] as usize]);
-                }
-            }
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256();
-            for b in (0..256usize).rev() {
-                if !n.children[b].is_null() {
-                    stack.push(n.children[b]);
-                }
-            }
-        }
-        _ => unreachable!(),
-    }
-}
-```
-
----
-
-## Range query (`range_iter`)
-
-### Construction and frame type
+The iterator is stack-based:
 
 ```rust
-impl<V> ARTMap<V> {
-    pub fn range_iter<'a>(
-        &'a self,
-        lo: Option<&'a [u8]>,
-        hi: Option<&'a [u8]>,
-    ) -> RangeIter<'a, V> {
-        let mut stack = Vec::new();
-        if !self.root.is_null() {
-            stack.push(RangeFrame { node: self.root, depth: 0, lo, hi });
-        }
-        RangeIter { stack, _marker: std::marker::PhantomData }
-    }
-}
-
-struct RangeFrame<'a, V> {
+pub(crate) struct RangeFrame<'a, V> {
     node: NodePtr<V>,
     depth: usize,
     lo: Option<&'a [u8]>,
@@ -968,26 +724,60 @@ pub struct RangeIter<'a, V> {
     stack: Vec<RangeFrame<'a, V>>,
     _marker: std::marker::PhantomData<&'a V>,
 }
-```
 
-### Prefix-key in bounds (shared with pruning branches)
-
-```rust
-unsafe fn inner_value_in_lex_range<'a, V>(
-    node: NodePtr<V>,
-    lo: Option<&'a [u8]>,
-    hi: Option<&'a [u8]>,
-) -> Option<(&'a [u8], &'a V)> {
-    let (kb, v) = inner_value_raw(node)?;
-    if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
-        Some((kb, v))
-    } else {
-        None
+impl<'a, V> RangeIter<'a, V> {
+    pub(crate) fn new(root: NodePtr<V>, lo: Option<&'a [u8]>, hi: Option<&'a [u8]>) -> Self {
+        let mut stack = Vec::new();
+        if !root.is_null() {
+            stack.push(RangeFrame {
+                node: root,
+                depth: 0,
+                lo,
+                hi,
+            });
+        }
+        RangeIter {
+            stack,
+            _marker: std::marker::PhantomData,
+        }
     }
 }
 ```
 
-### `RangeIter::next` and pruned child push
+Each stack frame says:
+
+- which node to visit,
+- how many key bytes are already fixed on the path above it,
+- whether the subtree is still constrained by the lower and upper bounds.
+
+The hard part of range scan is not the stack. It is the boundary bookkeeping:
+after comparing a subtree prefix with `lo` or `hi`, the iterator needs to know
+whether that subtree is:
+
+- impossible and should be pruned,
+- fully inside the range and now unconstrained,
+- still exactly on one bound,
+- or, for the upper bound, only allowed to yield the node’s own value.
+
+Instead of encoding that as ad-hoc booleans, the implementation names those
+states:
+
+```rust
+enum LowerBound<'a> {
+    Prune,
+    Free,
+    Follow(&'a [u8]),
+}
+
+enum UpperBound<'a> {
+    Prune,
+    Free,
+    Follow(&'a [u8]),
+    OwnOnly(&'a [u8]),
+}
+```
+
+### The core loop
 
 ```rust
 impl<'a, V> Iterator for RangeIter<'a, V> {
@@ -998,8 +788,8 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
             let frame = self.stack.pop()?;
             let node = frame.node;
             let depth = frame.depth;
-            let lo = frame.lo;
-            let hi = frame.hi;
+            let mut lo = frame.lo;
+            let mut hi = frame.hi;
 
             if node.is_leaf() {
                 let leaf = unsafe { &*((node.0 & !TAG_MASK) as *const Leaf<V>) };
@@ -1010,67 +800,55 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                 continue;
             }
 
-            let p = unsafe { inner_prefix_raw(node) };
-            let plen = p.len();
+            let prefix = unsafe { inner_prefix_raw(node) };
+            let plen = prefix.len();
             let nd = depth + plen;
 
-            let mut lo = lo;
-            let mut lo_on = false;
-            if let Some(lo_bytes) = lo {
-                let lo_avail = lo_bytes.len().saturating_sub(depth);
-                if lo_avail == 0 {
+            let lo_on = match lower_bound(prefix, depth, lo) {
+                LowerBound::Prune => continue,
+                LowerBound::Free => {
                     lo = None;
-                } else if plen == 0 {
-                    lo_on = true;
-                } else {
-                    let cn = plen.min(lo_avail);
-                    let pp = &p[..cn];
-                    let lp = &lo_bytes[depth..depth + cn];
-                    if pp < lp { continue; }
-                    if pp > lp { lo = None; }
-                    else if cn < plen { lo = None; }
-                    else if lo_avail > plen { lo_on = true; }
-                    else { lo = None; }
+                    false
                 }
-            }
+                LowerBound::Follow(lo_bytes) => {
+                    lo = Some(lo_bytes);
+                    true
+                }
+            };
 
-            let mut hi = hi;
-            let mut hi_on = false;
-            if let Some(hi_bytes) = hi {
-                let hi_avail = hi_bytes.len().saturating_sub(depth);
-                if hi_avail == 0 {
-                    if let Some((kb, v)) = unsafe { inner_value_in_lex_range(node, lo, Some(hi_bytes)) }
+            let hi_on = match upper_bound(prefix, depth, hi) {
+                UpperBound::Prune => continue,
+                UpperBound::Free => {
+                    hi = None;
+                    false
+                }
+                UpperBound::Follow(hi_bytes) => {
+                    hi = Some(hi_bytes);
+                    true
+                }
+                UpperBound::OwnOnly(hi_bytes) => {
+                    if let Some((kb, v)) =
+                        unsafe { inner_value_in_lex_range(node, lo, Some(hi_bytes)) }
                     {
                         return Some((kb, v));
                     }
                     continue;
-                } else if plen == 0 {
-                    hi_on = true;
-                } else {
-                    let cn = plen.min(hi_avail);
-                    let pp = &p[..cn];
-                    let hp = &hi_bytes[depth..depth + cn];
-                    if pp > hp { continue; }
-                    if pp < hp { hi = None; }
-                    else if cn < plen { continue; }
-                    else if hi_avail > plen { hi_on = true; }
-                    else {
-                        if let Some((kb, v)) =
-                            unsafe { inner_value_in_lex_range(node, lo, Some(hi_bytes)) }
-                        {
-                            return Some((kb, v));
-                        }
-                        continue;
-                    }
                 }
-            }
+            };
 
             let lo_byte: i16 = if lo_on { lo.unwrap()[nd] as i16 } else { -1 };
             let hi_byte: i16 = if hi_on { hi.unwrap()[nd] as i16 } else { 256 };
 
             push_range_children_rev(
-                node, nd + 1, lo_byte, hi_byte,
-                lo_on, lo, hi_on, hi, &mut self.stack,
+                node,
+                nd + 1,
+                lo_byte,
+                hi_byte,
+                lo_on,
+                lo,
+                hi_on,
+                hi,
+                &mut self.stack,
             );
 
             if let Some((kb, v)) = unsafe { inner_value_in_lex_range(node, lo, hi) } {
@@ -1079,7 +857,92 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
         }
     }
 }
+```
 
+### What the boundary logic is doing
+
+The best way to read the range scan now is: **compare the node prefix to each
+bound, get back a named state, then act on that state**.
+
+The two helper functions are:
+
+```rust
+fn lower_bound<'a>(prefix: &[u8], depth: usize, lo: Option<&'a [u8]>) -> LowerBound<'a> {
+    let Some(lo_bytes) = lo else {
+        return LowerBound::Free;
+    };
+    let lo_avail = lo_bytes.len().saturating_sub(depth);
+    if lo_avail == 0 {
+        return LowerBound::Free;
+    }
+    if prefix.is_empty() {
+        return LowerBound::Follow(lo_bytes);
+    }
+
+    let cn = prefix.len().min(lo_avail);
+    let pp = &prefix[..cn];
+    let lp = &lo_bytes[depth..depth + cn];
+    if pp < lp {
+        LowerBound::Prune
+    } else if pp > lp || cn < prefix.len() || lo_avail == prefix.len() {
+        LowerBound::Free
+    } else {
+        LowerBound::Follow(lo_bytes)
+    }
+}
+
+fn upper_bound<'a>(prefix: &[u8], depth: usize, hi: Option<&'a [u8]>) -> UpperBound<'a> {
+    let Some(hi_bytes) = hi else {
+        return UpperBound::Free;
+    };
+    let hi_avail = hi_bytes.len().saturating_sub(depth);
+    if hi_avail == 0 {
+        return UpperBound::OwnOnly(hi_bytes);
+    }
+    if prefix.is_empty() {
+        return UpperBound::Follow(hi_bytes);
+    }
+
+    let cn = prefix.len().min(hi_avail);
+    let pp = &prefix[..cn];
+    let hp = &hi_bytes[depth..depth + cn];
+    if pp > hp || cn < prefix.len() {
+        UpperBound::Prune
+    } else if pp < hp {
+        UpperBound::Free
+    } else if hi_avail == prefix.len() {
+        UpperBound::OwnOnly(hi_bytes)
+    } else {
+        UpperBound::Follow(hi_bytes)
+    }
+}
+```
+
+At an inner node, the iterator compares the node’s compressed prefix with the
+remaining bytes of `lo` and `hi`.
+
+That comparison yields one of three outcomes for each bound:
+
+1. **the entire subtree is outside the bound**  
+   abort this frame immediately.
+
+2. **the subtree is strictly inside the bound**  
+   drop that bound for the subtree (`lo = None` or `hi = None`).
+
+3. **the subtree is still exactly on the bound edge**  
+   keep carrying that bound downward.
+
+The upper bound has one extra outcome:
+
+4. **only the node’s own value can still match**  
+   yield the inner-node value if it is in range, but do not descend to children.
+
+Once the prefix is handled, only child bytes inside the admissible range are
+pushed.
+
+### Pushing only the children that can still match
+
+```rust
 fn push_range_children_rev<'a, V>(
     node: NodePtr<V>,
     child_depth: usize,
@@ -1093,10 +956,17 @@ fn push_range_children_rev<'a, V>(
 ) {
     let mut push = |byte: u8, child: NodePtr<V>| {
         let b = byte as i16;
-        if b < lo_byte || b > hi_byte { return; }
+        if b < lo_byte || b > hi_byte {
+            return;
+        }
         let child_lo = if lo_on && b == lo_byte { lo } else { None };
         let child_hi = if hi_on && b == hi_byte { hi } else { None };
-        stack.push(RangeFrame { node: child, depth: child_depth, lo: child_lo, hi: child_hi });
+        stack.push(RangeFrame {
+            node: child,
+            depth: child_depth,
+            lo: child_lo,
+            hi: child_hi,
+        });
     };
 
     match node.kind() {
@@ -1133,29 +1003,45 @@ fn push_range_children_rev<'a, V>(
 }
 ```
 
+The reverse push order is deliberate. Because the traversal pops from a stack,
+reverse push means **smallest key comes out first**, so the iterator yields
+sorted results.
+
+### Inner-node values participate in ranges too
+
+A prefix key stored on an inner node must also obey the bounds:
+
+```rust
+pub(crate) unsafe fn inner_value_in_lex_range<'a, V>(
+    node: NodePtr<V>,
+    lo: Option<&'a [u8]>,
+    hi: Option<&'a [u8]>,
+) -> Option<(&'a [u8], &'a V)> {
+    let (key, value) = inner_value_raw(node)?;
+    if lo.map_or(true, |lo| key >= lo) && hi.map_or(true, |hi| key <= hi) {
+        Some((key, value))
+    } else {
+        None
+    }
+}
+```
+
+That detail matters for ranges such as `[ab, abd]`, where `ab` itself is a key
+and must be yielded before `abc` and `abd`.
+
 ---
 
-## Speculations for future development
+## The shape of the whole design
 
-- **API polish:** expose `put`’s old value (already computed internally) and add
-  entry APIs akin to `BTreeMap::entry` for read-modify-write workloads.
-- **Borrowed keys on insert:** today inserts allocate `Box<[u8]>` for leaves and
-  prefix keys; an owned-key / `Cow` API could cut allocations for callers that
-  already hold an owned buffer.
-- **Deterministic shrinking policy:** shrink thresholds are fixed; workloads
-  that oscillate around a boundary might benefit from hysteresis or “shrink only
-  when below half capacity” rules to avoid flip-flopping shapes.
-- **SIMD / vectorized child search:** Node16’s binary search is already fine, but
-  very wide nodes under artificial benchmarks sometimes benefit from explicit
-  SIMD scans; real-world sparse nodes rarely need it.
-- **Concurrency:** a lock-free ART or reader-writer variant is a large project;
-  the current tagged-pointer layout assumes single-threaded mutation.
-- **Secondary indexes:** prefix iterators (`starts_with`) are a thin layer atop
-  `range_iter`; exposing them explicitly would match common string-key uses.
-- **Memory accounting:** optional counters for bytes in prefixes, leaves, and
-  node shells would help compare against `BTreeMap` beyond wall-clock time.
+Seen operation by operation, the implementation reduces to four habits:
 
-If you extend the code, keep the story straight: **get** explains navigation,
-**put** explains splits and growth, **delete** explains compaction and shrink,
-**iter** explains ordered traversal without recursion, and **range** explains how
-bounds flow down the trie without visiting the whole map.
+1. **walk by bytes**
+2. **consume compressed prefixes eagerly**
+3. **store prefix keys on inner nodes**
+4. **repair shape after mutation**
+
+`get` is the minimal read-only walk. `put` introduces splitting and growth.
+`delete` introduces compaction and shrinkage. Range scan adds the last piece:
+**prune entire subtrees as soon as a bound proves they cannot contribute**.
+
+That is the whole ART in operational form.
