@@ -32,6 +32,292 @@ bits [1:2] = 00 →  Node4
 ```
 
 ```rust
+const TAG_LEAF: usize = 1;
+const TAG_MASK: usize = 0b111;
+const KIND_NODE4: usize   = 0b000;
+const KIND_NODE16: usize  = 0b010;
+const KIND_NODE48: usize  = 0b100;
+const KIND_NODE256: usize = 0b110;
+
+struct NodePtr<V>(usize, std::marker::PhantomData<V>);
+```
+
+`NodePtr` is `Copy`—it's just an integer.  We implement `Clone` and
+`Copy` manually so that `V` doesn't need to be `Copy`:
+
+```rust
+impl<V> Clone for NodePtr<V> {
+    fn clone(&self) -> Self { NodePtr(self.0, std::marker::PhantomData) }
+}
+impl<V> Copy for NodePtr<V> {}
+```
+
+Classification is a mask check.  Construction takes a `Box`, leaks it
+to a raw pointer, ORs in the tag, and stores the result.  Recovering
+the pointer is the reverse: mask off the tag, cast to the right type.
+
+```rust
+pub(crate) fn as_leaf<'a>(self) -> &'a Leaf<V> {
+        debug_assert!(self.is_leaf());
+        unsafe { &*((self.0 & !TAG_MASK) as *const Leaf<V>) }
+    }
+```
+
+Every inner node type gets the same triple: `as_nodeN`, `as_nodeN_mut`,
+`into_nodeN_box`.  The `into_` variant reconstructs the `Box` to
+reclaim ownership for deallocation.
+
+---
+
+## 2. Node types
+
+### Leaf
+
+A leaf stores the full key and a value.  We keep the full key so that
+`get` can verify an exact match—the trie path only tells you the
+bytes consumed so far, and path compression means some bytes were
+skipped.  The key is a `Box<[u8]>` rather than a `Vec<u8>` because
+keys are write-once—the capacity field would be wasted.
+
+```rust
+pub(crate) struct Leaf<V> {
+    pub(crate) key: Box<[u8]>,
+    pub(crate) value: V,
+}
+
+impl<V> Leaf<V> {
+    pub(crate) fn new_ptr(key: &[u8], value: V) -> NodePtr<V> {
+        NodePtr::from_leaf(Box::new(Leaf {
+            key: Box::from(key),
+            value,
+        }))
+    }
+
+    pub(crate) fn matches(&self, key: &[u8]) -> bool {
+        *self.key == *key
+    }
+
+    pub(crate) fn get_value(&self, key: &[u8]) -> Option<&V> {
+        if self.matches(key) {
+            Some(&self.value)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn delete(node: NodePtr<V>, key: &[u8]) -> (NodePtr<V>, bool) {
+        if node.as_leaf().matches(key) {
+            drop(node.into_leaf_box());
+            (NodePtr::NULL, true)
+        } else {
+            (node, false)
+        }
+    }
+
+    pub(crate) fn put(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
+        let existing = node.as_leaf();
+        if existing.matches(key) {
+            let mut leaf_box = node.into_leaf_box();
+            leaf_box.value = value;
+            return (NodePtr::from_leaf(leaf_box), false);
+        }
+
+        let existing_key = &existing.key;
+        let common = crate::inner::prefix_mismatch(key, depth, existing_key, depth);
+        let sd = depth + common;
+
+        let mut nn = Box::new(Node4::<V>::new());
+        nn.header.prefix = crate::prefix::Prefix::from_slice(&key[depth..sd]);
+
+        let mut nn_ptr = NodePtr::from_node4(nn);
+
+        if sd == key.len() {
+            crate::inner::inner_set_value(&mut nn_ptr, Box::from(key), value);
+            crate::inner::inner_add_child(&mut nn_ptr, existing_key[sd], node);
+        } else if sd == existing_key.len() {
+            let existing_box = node.into_leaf_box();
+            crate::inner::inner_set_value(&mut nn_ptr, existing_box.key, existing_box.value);
+            crate::inner::inner_add_child(&mut nn_ptr, key[sd], Leaf::new_ptr(key, value));
+        } else {
+            let new_b = key[sd];
+            let old_b = existing_key[sd];
+            crate::inner::inner_add_child(&mut nn_ptr, new_b, Leaf::new_ptr(key, value));
+            crate::inner::inner_add_child(&mut nn_ptr, old_b, node);
+        }
+        (nn_ptr, true)
+    }
+}
+```
+
+### Inner node header
+
+Every inner node carries three things beyond its children:
+
+- **prefix**: an inline `Prefix` for path compression (see below).
+  If a chain of nodes each have exactly one child, we collapse them
+  into a single node whose prefix stores the skipped bytes.
+- **value**: an `Option<(Box<[u8]>, V)>`.  When a key like `"ab"` is
+  a prefix of another key like `"abc"`, the value for `"ab"` lives on
+  the inner node at the branch point, not in a leaf.  The `Box<[u8]>`
+  is the full key (for iteration and verification).
+- **count**: how many children are occupied.
+
+```rust
+pub(crate) type InnerValue<V> = Option<(Box<[u8]>, V)>;
+
+#[repr(C)]
+pub(crate) struct NodeHeader<V> {
+    pub(crate) prefix: Prefix,
+    pub(crate) value: InnerValue<V>,
+    pub(crate) count: u16,
+}
+```
+
+### Inline prefix
+
+Every inner node has a path-compression prefix.  The first version
+stored it as `Vec<u8>`—24 bytes (pointer + length + capacity) plus a
+separate heap allocation for the actual bytes.  Since the prefix is
+read at every tree level during traversal, that extra pointer chase
+costs a cache miss per level.
+
+The fix is a small-buffer enum:
+
+```rust
+const INLINE_PREFIX_CAP: usize = 22;
+
+enum Prefix {
+    Inline { len: u8, data: [u8; INLINE_PREFIX_CAP] },
+    Heap(Box<[u8]>),
+}
+```
+
+The `Heap` variant (a `Box<[u8]>` fat pointer) forces this enum to
+24 bytes—the same size as the `Vec<u8>` it replaces.  We use all
+that space: 1 byte discriminant + 1 byte length + 22 bytes of inline
+data.  Prefixes up to 22 bytes live directly in the node struct with
+zero heap allocation; longer prefixes (rare in practice) fall back to
+a heap-allocated `Box<[u8]>`.  For the benchmark workload (keys like
+`key000000000000`), prefixes are typically 1–5 bytes and always fit
+inline.
+
+### Node4
+
+Up to 4 children.  Keys and children are stored in parallel sorted
+arrays.  Lookup is a linear scan.
+
+```rust
+pub(crate) struct Node4<V> {
+    pub(crate) header: NodeHeader<V>,
+    pub(crate) keys: [u8; 4],
+    pub(crate) children: [NodePtr<V>; 4],
+}
+```
+
+### Node16
+
+Up to 16 children.  Same parallel-array layout, but lookup uses
+binary search.
+
+```rust
+pub(crate) struct Node16<V> {
+    pub(crate) header: NodeHeader<V>,
+    pub(crate) keys: [u8; 16],
+    pub(crate) children: [NodePtr<V>; 16],
+}
+```
+
+### Node48
+
+Up to 48 children.  A 256-byte index maps each byte value to a slot
+(or `0xFF` for "empty").  The slots array holds the actual child
+pointers.  Lookup is a single index into the 256-byte table, then a
+single index into the 48-slot array—O(1) regardless of child count.
+
+```rust
+pub(crate) struct Node48<V> {
+    pub(crate) header: NodeHeader<V>,
+    pub(crate) index: [u8; 256],
+    pub(crate) slots: [NodePtr<V>; 48],
+}
+```
+
+### Node256
+
+Up to 256 children.  Direct indexing by byte value.  Lookup is a
+single array access.
+
+```rust
+pub(crate) struct Node256<V> {
+    pub(crate) header: NodeHeader<V>,
+    pub(crate) children: [NodePtr<V>; 256],
+}
+```
+
+The trade-off is memory: Node4 is about 80 bytes, Node256 is about
+2 KiB.  The adaptive sizing means most nodes are small (Node4 or
+Node16 in practice), while hot dense nodes get the fast direct
+indexing of Node48/Node256.
+
+---
+
+## 3. The public API
+
+```rust
+pub struct ARTMap<V> {
+    root: NodePtr<V>,
+    len: usize,
+}
+```
+
+The surface is small: `put`, `get`, `delete`, `iter`, `range_iter`.
+
+---
+
+## 4. Lookup
+
+`get` walks from root to leaf, consuming one byte of the key at each
+level.  At each inner node it first checks the path-compressed prefix,
+then looks up the next byte in the node's children.
+
+The key subtlety is the `depth == key.len()` check: if we've consumed
+the entire key but we're at an inner node (not a leaf), the key's
+value is stored on this inner node—this is the prefix-key case.
+
+```rust
+unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
+        let mut node = self.root;
+        let mut depth = 0;
+
+        while !node.is_null() {
+            if node.is_leaf() {
+                return node.as_leaf().get_value(key);
+            }
+
+            let prefix = inner_prefix_raw(node);
+            let plen = prefix.len();
+            if key.len() < depth + plen || key[depth..depth + plen] != *prefix {
+                return None;
+            }
+            depth += plen;
+
+            if depth == key.len() {
+                return crate::inner::inner_value_raw(node).map(|(_, value)| value);
+            }
+
+            let b = key[depth];
+            node = inner_find(node, b);
+            depth += 1;
+        }
+        None
+    }
+```
+
+`inner_find` dispatches on node kind.  Node4 does a linear scan,
+Node16 does binary search, Node48 does an index-table lookup, Node256
+does a direct array access:
+
+```rust
 pub(crate) fn inner_find<V>(node: NodePtr<V>, b: u8) -> NodePtr<V> {
     dispatch!(node, find_child, b)
 }
@@ -119,12 +405,7 @@ when the source's `Vec` was freed while the destination still pointed
 to the same allocation.
 
 ```rust
-fn inner_move_header<V>(src: &mut NodePtr<V>, dst: &mut NodePtr<V>) {
-    let prefix = inner_take_prefix(src);    // src.prefix becomes empty
-    let value = inner_clear_value(src);     // src.value becomes None
-    inner_set_prefix(dst, prefix);
-    // set dst.value = value ...
-}
+
 ```
 
 Growth example—Node4 to Node16:

@@ -28,6 +28,439 @@ The recurring idea is simple:
 All four operations start in `ARTMap<V>`:
 
 ```rust
+unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
+        let mut node = self.root;
+        let mut depth = 0;
+
+        while !node.is_null() {
+            if node.is_leaf() {
+                return node.as_leaf().get_value(key);
+            }
+
+            let prefix = inner_prefix_raw(node);
+            let plen = prefix.len();
+            if key.len() < depth + plen || key[depth..depth + plen] != *prefix {
+                return None;
+            }
+            depth += plen;
+
+            if depth == key.len() {
+                return crate::inner::inner_value_raw(node).map(|(_, value)| value);
+            }
+
+            let b = key[depth];
+            node = inner_find(node, b);
+            depth += 1;
+        }
+        None
+    }
+```
+
+The public methods are deliberately thin. The interesting logic lives in the
+recursive walkers and the inner-node helpers.
+
+---
+
+## 1. Get
+
+Lookup is the cleanest operation, so it is the best place to learn the tree.
+
+The walk carries two pieces of state:
+
+- `node`: where we are in the tree,
+- `depth`: how many bytes of the key have already been consumed.
+
+```rust
+unsafe fn get_inner(&self, key: &[u8]) -> Option<&V> {
+    let mut node = self.root;
+    let mut depth = 0;
+
+    while !node.is_null() {
+        if node.is_leaf() {
+            let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
+            if *leaf.key == *key {
+                return Some(&leaf.value);
+            }
+            return None;
+        }
+
+        let prefix = inner_prefix_raw(node);
+        let plen = prefix.len();
+        if key.len() < depth + plen || key[depth..depth + plen] != *prefix {
+            return None;
+        }
+        depth += plen;
+
+        if depth == key.len() {
+            return crate::inner::inner_value_raw(node).map(|(_, value)| value);
+        }
+
+        let b = key[depth];
+        node = inner_find(node, b);
+        depth += 1;
+    }
+    None
+}
+```
+
+### Step 1: if we hit a leaf, verify the whole key
+
+ART navigation only gets us to a **candidate**. Because of path compression, the
+traversal knows that the bytes seen so far match, but it does not by itself
+prove full-key equality. So the leaf stores the whole key:
+
+```rust
+pub(crate) struct Leaf<V> {
+    pub(crate) key: Box<[u8]>,
+    pub(crate) value: V,
+}
+```
+
+That is why the leaf case does a final `leaf.key == key` check.
+
+### Step 2: if we hit an inner node, compare the compressed prefix
+
+Each inner node stores a prefix shared by every key in its subtree. Lookup must
+consume that prefix before it looks for the next branch byte:
+
+```rust
+pub(crate) unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
+    let header = &*(node.inner_ptr() as *const crate::raw::NodeHeader<V>);
+    header.prefix.as_slice()
+}
+```
+
+If the query ends *exactly* at that inner node, the value may live there instead
+of in a leaf. That is how the tree represents keys like `ab` and `abc`
+simultaneously:
+
+```rust
+pub(crate) unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> {
+    let header = &*(node.inner_ptr() as *const crate::raw::NodeHeader<V>);
+    let opt = &header.value;
+    opt.as_ref().map(|(key, value)| (&**key, value))
+}
+```
+
+### Step 3: choose the child for the next byte
+
+All node shapes share the same logical operation — “find the child for byte
+`b`” — but each shape implements it differently:
+
+```rust
+pub(crate) fn inner_find<V>(node: NodePtr<V>, b: u8) -> NodePtr<V> {
+    dispatch!(node, find_child, b)
+}
+```
+
+That is the whole lookup algorithm: validate prefix, maybe return the inner-node
+value, otherwise follow one byte to the next node.
+
+---
+
+## 2. Put
+
+Insertion is where the ART earns its keep. It must handle:
+
+- adding into an empty slot,
+- overwriting an existing leaf,
+- splitting a leaf into a branching inner node,
+- splitting an inner node when a compressed prefix only partially matches,
+- storing values on inner nodes for prefix keys,
+- growing a node when it runs out of room.
+
+The key helper is “how far do these two byte slices agree?”:
+
+```rust
+pub(crate) fn prefix_mismatch(a: &[u8], a_off: usize, b: &[u8], b_off: usize) -> usize {
+    let n = (a.len() - a_off).min(b.len() - b_off);
+    for i in 0..n {
+        if a[a_off + i] != b[b_off + i] {
+            return i;
+        }
+    }
+    n
+}
+```
+
+Before the recursive insert, the implementation names a tiny helper:
+
+```rust
+fn leaf_ptr<V>(key: &[u8], value: V) -> NodePtr<V> {
+    NodePtr::from_leaf(Box::new(Leaf {
+        key: Box::from(key),
+        value,
+    }))
+}
+```
+
+That helper matters because insertion creates leaves in several branches. Giving
+that action a name makes the recursive logic read in terms of tree structure
+instead of allocation boilerplate.
+
+### The insertion walk
+
+```rust
+fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
+    if node.is_null() {
+        return (Leaf::new_ptr(key, value), true);
+    }
+
+    if node.is_leaf() {
+        return Leaf::put(node, key, value, depth);
+    }
+
+    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+    let plen = prefix.len();
+    let ml = prefix_mismatch(key, depth, &prefix, 0);
+
+    if ml < plen {
+        let mut nn = Box::new(Node4::<V>::new());
+        nn.header.prefix = Prefix::from_slice(&prefix[..ml]);
+        let mut nn_ptr = NodePtr::from_node4(nn);
+
+        let mut old_node = node;
+        inner_set_prefix(&mut old_node, Prefix::from_slice(&prefix[ml + 1..]));
+        inner_add_child(&mut nn_ptr, prefix[ml], old_node);
+
+        let nd = depth + ml;
+        if nd == key.len() {
+            inner_set_value(&mut nn_ptr, Box::from(key), value);
+        } else {
+            inner_add_child(&mut nn_ptr, key[nd], Leaf::new_ptr(key, value));
+        }
+        return (nn_ptr, true);
+    }
+
+    let nd = depth + plen;
+    let mut node = node;
+
+    if nd == key.len() {
+        let added = !inner_has_value(&node);
+        inner_set_value(&mut node, Box::from(key), value);
+        return (node, added);
+    }
+
+    let b = key[nd];
+    let child = inner_find(node, b);
+
+    if child.is_null() {
+        if inner_is_full(&node) {
+            node = grow(node);
+        }
+        inner_add_child(&mut node, b, Leaf::new_ptr(key, value));
+        return (node, true);
+    }
+
+    let (new_child, added) = put_recursive(child, key, value, nd + 1);
+    if new_child.0 != child.0 {
+        inner_replace_child(&mut node, b, new_child);
+    }
+    (node, added)
+}
+```
+
+### Case A: empty slot -> leaf
+
+This is the base case. No subtree exists, so insertion allocates a new leaf and
+returns it.
+
+### Case B: leaf -> overwrite or split
+
+If the keys are identical, insertion is just an overwrite.
+
+One simplification worth calling out: `put_recursive` now returns only
+`(new_node, added)`. The earlier version carried an extra `V` back up the stack
+even though `ARTMap::put` never used it. Removing that dead value made the code
+match the real question insertion is answering: **did the subtree root change,
+and did the map grow?**
+
+If they differ, one leaf is no longer enough. The code allocates a `Node4`,
+stores the common bytes as its prefix, and then handles one of three subcases:
+
+1. the **new key** is a prefix of the old key,
+2. the **old key** is a prefix of the new key,
+3. neither key is a prefix; they simply branch at the split byte.
+
+That is the first important design move in the implementation: **branch points
+become inner nodes, and prefix keys live on those nodes**.
+
+### Case C: inner node -> prefix split or descend
+
+If the incoming key only partially matches the node’s compressed prefix, the
+node itself must be split. The existing node keeps the unmatched suffix of the
+old prefix; a fresh `Node4` becomes the new parent and holds the common prefix.
+
+If the full prefix matches, insertion either:
+
+- stores a value on the current node (when the key ends here),
+- adds a new child leaf (when no child exists for the next byte),
+- or recurses into the existing child.
+
+### Growing nodes
+
+When an inner node is full, insertion promotes it to the next shape before
+adding the new child:
+
+```rust
+pub(crate) fn grow<V>(node: NodePtr<V>) -> NodePtr<V> {
+    match node.kind() {
+        KIND_NODE4 => Node4::grow(node),
+        KIND_NODE16 => Node16::grow(node),
+        KIND_NODE48 => Node48::grow(node),
+        _ => unreachable!("Node256 cannot grow"),
+    }
+}
+```
+
+The header move is important: growth keeps the **prefix** and the optional
+**inner-node value** intact while only changing the child representation.
+
+---
+
+## 3. Delete
+
+Deletion mirrors insertion in the forward direction, then does extra work on
+the way back up to keep the tree compact.
+
+```rust
+fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V>, bool) {
+    if node.is_null() {
+        return (NodePtr::NULL, false);
+    }
+
+    if node.is_leaf() {
+        return Leaf::delete(node, key);
+    }
+
+    let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+    let plen = prefix.len();
+    if key.len() < depth + plen || key[depth..depth + plen] != prefix[..] {
+        return (node, false);
+    }
+
+    let nd = depth + plen;
+    let mut node = node;
+
+    if nd == key.len() {
+        if !inner_has_value(&node) {
+            return (node, false);
+        }
+        inner_clear_value(&mut node);
+        return (compact(node), true);
+    }
+
+    let b = key[nd];
+    let child = inner_find(node, b);
+    if child.is_null() {
+        return (node, false);
+    }
+
+    let (new_child, deleted) = delete_recursive(child, key, nd + 1);
+    if !deleted {
+        return (node, false);
+    }
+
+    if new_child.is_null() {
+        inner_remove_child(&mut node, b);
+    } else {
+        inner_replace_child(&mut node, b, new_child);
+    }
+
+    (compact(node), true)
+}
+```
+
+### The forward walk
+
+The forward half is straightforward:
+
+- `NULL` means “not found,”
+- a leaf is deleted only on exact key match,
+- an inner node must match its compressed prefix before we descend,
+- if the key ends exactly at an inner node, deletion clears the stored prefix
+  value instead of removing a child.
+
+### Removing a child
+
+Once a recursive delete succeeds, the parent either removes the child slot or
+replaces it with a compacted child pointer:
+
+```rust
+pub(crate) fn inner_remove_child<V>(node: &mut NodePtr<V>, b: u8) {
+    dispatch_mut!(node, remove_child, b)
+}
+```
+
+### Compaction
+
+The crucial cleanup step is `compact`:
+
+```rust
+pub(crate) fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+    let count = inner_count(&node);
+
+    if count == 0 {
+        if inner_has_value(&node) {
+            let val = inner_clear_value(&mut node);
+            free_inner_node_shell(node);
+            let (key, value) = val.unwrap();
+            return NodePtr::from_leaf(Box::new(Leaf { key, value }));
+        }
+        free_inner_node_shell(node);
+        return NodePtr::NULL;
+    }
+
+    if count == 1 && !inner_has_value(&node) {
+        let children = inner_children(&node);
+        let (b, child) = children[0];
+        if child.is_leaf() {
+            free_inner_node_shell(node);
+            return child;
+        }
+        let parent_prefix = unsafe { inner_prefix_raw(node) }.to_vec();
+        free_inner_node_shell(node);
+        let mut child = child;
+        let child_prefix = inner_take_prefix(&mut child);
+        let mut merged = parent_prefix;
+        merged.push(b);
+        merged.extend_from_slice(child_prefix.as_slice());
+        inner_set_prefix(&mut child, Prefix::from_slice(&merged));
+        return child;
+    }
+
+    let should_shrink = match node.kind() {
+        KIND_NODE256 => count <= 48,
+        KIND_NODE48 => count <= 16,
+        KIND_NODE16 => count <= 4,
+        _ => false,
+    };
+    if should_shrink {
+        return shrink(node);
+    }
+
+    node
+}
+```
+
+`compact` handles three structural repairs:
+
+1. **no children left**  
+   If the node still has its own value, it becomes a leaf. Otherwise it becomes
+   null.
+
+2. **exactly one child and no own value**  
+   The node is redundant. If the child is a leaf, we return it directly. If the
+   child is another inner node, we merge:
+
+   `parent.prefix + branch_byte + child.prefix`
+
+3. **too sparse for its current shape**  
+   The node shrinks to the next smaller representation.
+
+Shrinkage is the inverse of growth:
+
+```rust
 pub(crate) fn shrink<V>(node: NodePtr<V>) -> NodePtr<V> {
     match node.kind() {
         KIND_NODE256 => Node256::shrink(node),
