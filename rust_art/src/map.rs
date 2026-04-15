@@ -147,49 +147,13 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
     (compact(node), true)
 }
 
-fn leaf_ptr<V>(key: &[u8], value: V) -> NodePtr<V> {
-    NodePtr::from_leaf(Box::new(Leaf {
-        key: Box::from(key),
-        value,
-    }))
-}
-
 fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
     if node.is_null() {
-        return (leaf_ptr(key, value), true);
+        return (Leaf::new_ptr(key, value), true);
     }
 
     if node.is_leaf() {
-        let existing = node.as_leaf();
-        if existing.matches(key) {
-            let mut leaf_box = node.into_leaf_box();
-            leaf_box.value = value;
-            return (NodePtr::from_leaf(leaf_box), false);
-        }
-
-        let existing_key = &existing.key;
-        let common = prefix_mismatch(key, depth, existing_key, depth);
-        let sd = depth + common;
-
-        let mut nn = Box::new(Node4::<V>::new());
-        nn.header.prefix = Prefix::from_slice(&key[depth..sd]);
-
-        let mut nn_ptr = NodePtr::from_node4(nn);
-
-        if sd == key.len() {
-            inner_set_value(&mut nn_ptr, Box::from(key), value);
-            inner_add_child(&mut nn_ptr, existing_key[sd], node);
-        } else if sd == existing_key.len() {
-            let existing_box = node.into_leaf_box();
-            inner_set_value(&mut nn_ptr, existing_box.key, existing_box.value);
-            inner_add_child(&mut nn_ptr, key[sd], leaf_ptr(key, value));
-        } else {
-            let new_b = key[sd];
-            let old_b = existing_key[sd];
-            inner_add_child(&mut nn_ptr, new_b, leaf_ptr(key, value));
-            inner_add_child(&mut nn_ptr, old_b, node);
-        }
-        return (nn_ptr, true);
+        return Leaf::put(node, key, value, depth);
     }
 
     let prefix = unsafe { inner_prefix_raw(node) }.to_vec();
@@ -209,7 +173,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if nd == key.len() {
             inner_set_value(&mut nn_ptr, Box::from(key), value);
         } else {
-            inner_add_child(&mut nn_ptr, key[nd], leaf_ptr(key, value));
+            inner_add_child(&mut nn_ptr, key[nd], Leaf::new_ptr(key, value));
         }
         return (nn_ptr, true);
     }
@@ -230,7 +194,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         if inner_is_full(&node) {
             node = grow(node);
         }
-        inner_add_child(&mut node, b, leaf_ptr(key, value));
+        inner_add_child(&mut node, b, Leaf::new_ptr(key, value));
         return (node, true);
     }
 

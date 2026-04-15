@@ -200,6 +200,13 @@ pub(crate) struct Leaf<V> {
 }
 
 impl<V> Leaf<V> {
+    pub(crate) fn new_ptr(key: &[u8], value: V) -> NodePtr<V> {
+        NodePtr::from_leaf(Box::new(Leaf {
+            key: Box::from(key),
+            value,
+        }))
+    }
+
     pub(crate) fn matches(&self, key: &[u8]) -> bool {
         *self.key == *key
     }
@@ -219,6 +226,39 @@ impl<V> Leaf<V> {
         } else {
             (node, false)
         }
+    }
+
+    pub(crate) fn put(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (NodePtr<V>, bool) {
+        let existing = node.as_leaf();
+        if existing.matches(key) {
+            let mut leaf_box = node.into_leaf_box();
+            leaf_box.value = value;
+            return (NodePtr::from_leaf(leaf_box), false);
+        }
+
+        let existing_key = &existing.key;
+        let common = crate::inner::prefix_mismatch(key, depth, existing_key, depth);
+        let sd = depth + common;
+
+        let mut nn = Box::new(Node4::<V>::new());
+        nn.header.prefix = crate::prefix::Prefix::from_slice(&key[depth..sd]);
+
+        let mut nn_ptr = NodePtr::from_node4(nn);
+
+        if sd == key.len() {
+            crate::inner::inner_set_value(&mut nn_ptr, Box::from(key), value);
+            crate::inner::inner_add_child(&mut nn_ptr, existing_key[sd], node);
+        } else if sd == existing_key.len() {
+            let existing_box = node.into_leaf_box();
+            crate::inner::inner_set_value(&mut nn_ptr, existing_box.key, existing_box.value);
+            crate::inner::inner_add_child(&mut nn_ptr, key[sd], Leaf::new_ptr(key, value));
+        } else {
+            let new_b = key[sd];
+            let old_b = existing_key[sd];
+            crate::inner::inner_add_child(&mut nn_ptr, new_b, Leaf::new_ptr(key, value));
+            crate::inner::inner_add_child(&mut nn_ptr, old_b, node);
+        }
+        (nn_ptr, true)
     }
 }
 
