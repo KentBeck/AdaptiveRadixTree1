@@ -4,6 +4,30 @@ use crate::raw::{
     KIND_NODE256, KIND_NODE4, KIND_NODE48,
 };
 
+macro_rules! dispatch {
+    ($node:expr, $method:ident $(, $arg:expr)*) => {
+        match $node.kind() {
+            KIND_NODE4 => $node.as_node4().$method($($arg),*),
+            KIND_NODE16 => $node.as_node16().$method($($arg),*),
+            KIND_NODE48 => $node.as_node48().$method($($arg),*),
+            KIND_NODE256 => $node.as_node256().$method($($arg),*),
+            _ => unreachable!(),
+        }
+    };
+}
+
+macro_rules! dispatch_mut {
+    ($node:expr, $method:ident $(, $arg:expr)*) => {
+        match $node.kind() {
+            KIND_NODE4 => $node.as_node4_mut().$method($($arg),*),
+            KIND_NODE16 => $node.as_node16_mut().$method($($arg),*),
+            KIND_NODE48 => $node.as_node48_mut().$method($($arg),*),
+            KIND_NODE256 => $node.as_node256_mut().$method($($arg),*),
+            _ => unreachable!(),
+        }
+    };
+}
+
 pub(crate) unsafe fn inner_prefix_raw<'a, V>(node: NodePtr<V>) -> &'a [u8] {
     let header = &*(node.inner_ptr() as *const crate::raw::NodeHeader<V>);
     header.prefix.as_slice()
@@ -29,36 +53,7 @@ pub(crate) unsafe fn inner_value_in_lex_range<'a, V>(
 }
 
 pub(crate) fn inner_find<V>(node: NodePtr<V>, b: u8) -> NodePtr<V> {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4();
-            for i in 0..n.header.count as usize {
-                if n.keys[i] == b {
-                    return n.children[i];
-                }
-            }
-            NodePtr::NULL
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16();
-            let cnt = n.header.count as usize;
-            match n.keys[..cnt].binary_search(&b) {
-                Ok(i) => n.children[i],
-                Err(_) => NodePtr::NULL,
-            }
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48();
-            let idx = n.index[b as usize];
-            if idx == 0xFF {
-                NodePtr::NULL
-            } else {
-                n.slots[idx as usize]
-            }
-        }
-        KIND_NODE256 => node.as_node256().children[b as usize],
-        _ => unreachable!(),
-    }
+    dispatch!(node, find_child, b)
 }
 
 pub(crate) fn prefix_mismatch(a: &[u8], a_off: usize, b: &[u8], b_off: usize) -> usize {
@@ -72,76 +67,11 @@ pub(crate) fn prefix_mismatch(a: &[u8], a_off: usize, b: &[u8], b_off: usize) ->
 }
 
 pub(crate) fn inner_add_child<V>(node: &mut NodePtr<V>, b: u8, child: NodePtr<V>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4_mut();
-            let cnt = n.header.count as usize;
-            let pos = n.keys[..cnt].iter().position(|&k| k > b).unwrap_or(cnt);
-            for i in (pos..cnt).rev() {
-                n.keys[i + 1] = n.keys[i];
-                n.children[i + 1] = n.children[i];
-            }
-            n.keys[pos] = b;
-            n.children[pos] = child;
-            n.header.count += 1;
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16_mut();
-            let cnt = n.header.count as usize;
-            let pos = n.keys[..cnt].iter().position(|&k| k > b).unwrap_or(cnt);
-            for i in (pos..cnt).rev() {
-                n.keys[i + 1] = n.keys[i];
-                n.children[i + 1] = n.children[i];
-            }
-            n.keys[pos] = b;
-            n.children[pos] = child;
-            n.header.count += 1;
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48_mut();
-            let slot = (0u8..48).find(|&j| n.slots[j as usize].is_null()).unwrap();
-            n.index[b as usize] = slot;
-            n.slots[slot as usize] = child;
-            n.header.count += 1;
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256_mut();
-            n.children[b as usize] = child;
-            n.header.count += 1;
-        }
-        _ => unreachable!(),
-    }
+    dispatch_mut!(node, add_child, b, child)
 }
 
 pub(crate) fn inner_replace_child<V>(node: &mut NodePtr<V>, b: u8, child: NodePtr<V>) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4_mut();
-            for i in 0..n.header.count as usize {
-                if n.keys[i] == b {
-                    n.children[i] = child;
-                    return;
-                }
-            }
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16_mut();
-            let cnt = n.header.count as usize;
-            if let Ok(i) = n.keys[..cnt].binary_search(&b) {
-                n.children[i] = child;
-            }
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48_mut();
-            let idx = n.index[b as usize];
-            n.slots[idx as usize] = child;
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256_mut();
-            n.children[b as usize] = child;
-        }
-        _ => unreachable!(),
-    }
+    dispatch_mut!(node, replace_child, b, child)
 }
 
 pub(crate) fn inner_is_full<V>(node: &NodePtr<V>) -> bool {
@@ -178,209 +108,30 @@ pub(crate) fn inner_take_prefix<V>(node: &mut NodePtr<V>) -> Prefix {
     std::mem::take(&mut node.header_mut().prefix)
 }
 
-pub(crate) fn inner_move_header<V>(src: &mut NodePtr<V>, dst: &mut NodePtr<V>) {
-    let prefix = inner_take_prefix(src);
-    let value = inner_clear_value(src);
-    inner_set_prefix(dst, prefix);
-    dst.header_mut().value = value;
-}
-
-pub(crate) fn grow<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+pub(crate) fn grow<V>(node: NodePtr<V>) -> NodePtr<V> {
     match node.kind() {
-        KIND_NODE4 => {
-            let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node4();
-            let cnt = old.header.count as usize;
-            {
-                let dst = new_ptr.as_node16_mut();
-                dst.keys[..cnt].copy_from_slice(&old.keys[..cnt]);
-                dst.children[..cnt].copy_from_slice(&old.children[..cnt]);
-                dst.header.count = cnt as u16;
-            }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE16 => {
-            let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node16();
-            let cnt = old.header.count as usize;
-            {
-                let dst = new_ptr.as_node48_mut();
-                for i in 0..cnt {
-                    let b = old.keys[i];
-                    dst.index[b as usize] = i as u8;
-                    dst.slots[i] = old.children[i];
-                }
-                dst.header.count = cnt as u16;
-            }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE48 => {
-            let mut new_ptr = NodePtr::from_node256(Box::new(Node256::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node48();
-            {
-                let dst = new_ptr.as_node256_mut();
-                let mut cnt = 0u16;
-                for b in 0..256usize {
-                    let idx = old.index[b];
-                    if idx != 0xFF {
-                        dst.children[b] = old.slots[idx as usize];
-                        cnt += 1;
-                    }
-                }
-                dst.header.count = cnt;
-            }
-            free_inner_node_shell(node);
-            new_ptr
-        }
+        KIND_NODE4 => Node4::grow(node),
+        KIND_NODE16 => Node16::grow(node),
+        KIND_NODE48 => Node48::grow(node),
         _ => unreachable!("Node256 cannot grow"),
     }
 }
 
-pub(crate) fn shrink<V>(mut node: NodePtr<V>) -> NodePtr<V> {
+pub(crate) fn shrink<V>(node: NodePtr<V>) -> NodePtr<V> {
     match node.kind() {
-        KIND_NODE256 => {
-            let mut new_ptr = NodePtr::from_node48(Box::new(Node48::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node256();
-            {
-                let dst = new_ptr.as_node48_mut();
-                let mut slot = 0u8;
-                for b in 0..256usize {
-                    if !old.children[b].is_null() {
-                        dst.index[b] = slot;
-                        dst.slots[slot as usize] = old.children[b];
-                        slot += 1;
-                    }
-                }
-                dst.header.count = slot as u16;
-            }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE48 => {
-            let mut new_ptr = NodePtr::from_node16(Box::new(Node16::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node48();
-            {
-                let dst = new_ptr.as_node16_mut();
-                let mut cnt = 0usize;
-                for b in 0..256usize {
-                    let idx = old.index[b];
-                    if idx != 0xFF {
-                        dst.keys[cnt] = b as u8;
-                        dst.children[cnt] = old.slots[idx as usize];
-                        cnt += 1;
-                    }
-                }
-                dst.header.count = cnt as u16;
-            }
-            free_inner_node_shell(node);
-            new_ptr
-        }
-        KIND_NODE16 => {
-            let mut new_ptr = NodePtr::from_node4(Box::new(Node4::<V>::new()));
-            inner_move_header(&mut node, &mut new_ptr);
-            let old = node.as_node16();
-            let cnt = old.header.count as usize;
-            {
-                let dst = new_ptr.as_node4_mut();
-                dst.keys[..cnt].copy_from_slice(&old.keys[..cnt]);
-                dst.children[..cnt].copy_from_slice(&old.children[..cnt]);
-                dst.header.count = cnt as u16;
-            }
-            free_inner_node_shell(node);
-            new_ptr
-        }
+        KIND_NODE256 => Node256::shrink(node),
+        KIND_NODE48 => Node48::shrink(node),
+        KIND_NODE16 => Node16::shrink(node),
         _ => node,
     }
 }
 
 pub(crate) fn inner_remove_child<V>(node: &mut NodePtr<V>, b: u8) {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4_mut();
-            let cnt = n.header.count as usize;
-            if let Some(pos) = n.keys[..cnt].iter().position(|&k| k == b) {
-                for i in pos..cnt - 1 {
-                    n.keys[i] = n.keys[i + 1];
-                    n.children[i] = n.children[i + 1];
-                }
-                n.children[cnt - 1] = NodePtr::NULL;
-                n.header.count -= 1;
-            }
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16_mut();
-            let cnt = n.header.count as usize;
-            if let Ok(pos) = n.keys[..cnt].binary_search(&b) {
-                for i in pos..cnt - 1 {
-                    n.keys[i] = n.keys[i + 1];
-                    n.children[i] = n.children[i + 1];
-                }
-                n.children[cnt - 1] = NodePtr::NULL;
-                n.header.count -= 1;
-            }
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48_mut();
-            let idx = n.index[b as usize];
-            if idx != 0xFF {
-                n.slots[idx as usize] = NodePtr::NULL;
-                n.index[b as usize] = 0xFF;
-                n.header.count -= 1;
-            }
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256_mut();
-            if !n.children[b as usize].is_null() {
-                n.children[b as usize] = NodePtr::NULL;
-                n.header.count -= 1;
-            }
-        }
-        _ => unreachable!(),
-    }
+    dispatch_mut!(node, remove_child, b)
 }
 
 pub(crate) fn inner_children<V>(node: &NodePtr<V>) -> Vec<(u8, NodePtr<V>)> {
-    match node.kind() {
-        KIND_NODE4 => {
-            let n = node.as_node4();
-            let cnt = n.header.count as usize;
-            (0..cnt).map(|i| (n.keys[i], n.children[i])).collect()
-        }
-        KIND_NODE16 => {
-            let n = node.as_node16();
-            let cnt = n.header.count as usize;
-            (0..cnt).map(|i| (n.keys[i], n.children[i])).collect()
-        }
-        KIND_NODE48 => {
-            let n = node.as_node48();
-            let mut out = Vec::new();
-            for b in 0..256usize {
-                let idx = n.index[b];
-                if idx != 0xFF {
-                    out.push((b as u8, n.slots[idx as usize]));
-                }
-            }
-            out
-        }
-        KIND_NODE256 => {
-            let n = node.as_node256();
-            let mut out = Vec::new();
-            for b in 0..256usize {
-                if !n.children[b].is_null() {
-                    out.push((b as u8, n.children[b]));
-                }
-            }
-            out
-        }
-        _ => unreachable!(),
-    }
+    dispatch!(node, get_children)
 }
 
 pub(crate) fn compact<V>(mut node: NodePtr<V>) -> NodePtr<V> {

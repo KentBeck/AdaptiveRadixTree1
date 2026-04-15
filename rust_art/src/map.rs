@@ -5,7 +5,7 @@ use crate::inner::{
 };
 use crate::iter::{Iter, RangeIter};
 use crate::prefix::Prefix;
-use crate::raw::{Leaf, Node4, NodePtr, TAG_MASK};
+use crate::raw::{Leaf, Node4, NodePtr};
 
 pub struct ARTMap<V> {
     root: NodePtr<V>,
@@ -55,8 +55,8 @@ impl<V> ARTMap<V> {
 
         while !node.is_null() {
             if node.is_leaf() {
-                let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
-                if *leaf.key == *key {
+                let leaf = node.as_leaf();
+                if leaf.matches(key) {
                     return Some(&leaf.value);
                 }
                 return None;
@@ -111,7 +111,7 @@ fn delete_recursive<V>(node: NodePtr<V>, key: &[u8], depth: usize) -> (NodePtr<V
     }
 
     if node.is_leaf() {
-        if *node.as_leaf().key == *key {
+        if node.as_leaf().matches(key) {
             drop(node.into_leaf_box());
             return (NodePtr::NULL, true);
         }
@@ -169,7 +169,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
 
     if node.is_leaf() {
         let existing = node.as_leaf();
-        if *existing.key == *key {
+        if existing.matches(key) {
             let mut leaf_box = node.into_leaf_box();
             leaf_box.value = value;
             return (NodePtr::from_leaf(leaf_box), false);
