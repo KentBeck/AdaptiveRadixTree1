@@ -403,6 +403,7 @@ impl<V> ARTMap<V> {
 
         while !node.is_null() {
             if node.is_leaf() {
+                // Raw deref: returned refs must outlive the copied `NodePtr` local, not `as_leaf(&node)`.
                 let leaf = &*((node.0 & !TAG_MASK) as *const Leaf<V>);
                 if *leaf.key == *key {
                     return Some(&leaf.value);
@@ -600,11 +601,9 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                 let hi_avail = hi_bytes.len().saturating_sub(depth);
                 if hi_avail == 0 {
                     // hi exhausted: only own value could match
-                    if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                        let kb = k;
-                        if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
-                            return Some((kb, v));
-                        }
+                    if let Some((kb, v)) = unsafe { inner_value_in_lex_range(node, lo, Some(hi_bytes)) }
+                    {
+                        return Some((kb, v));
                     }
                     continue;
                 } else if plen == 0 {
@@ -619,11 +618,10 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
                     else if hi_avail > plen { hi_on = true; }
                     else {
                         // hi exhausted at nd; own value may match, children > hi
-                        if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                            let kb = k;
-                            if lo.map_or(true, |lo| kb >= lo) && kb <= hi_bytes {
-                                return Some((kb, v));
-                            }
+                        if let Some((kb, v)) =
+                            unsafe { inner_value_in_lex_range(node, lo, Some(hi_bytes)) }
+                        {
+                            return Some((kb, v));
                         }
                         continue;
                     }
@@ -640,11 +638,8 @@ impl<'a, V> Iterator for RangeIter<'a, V> {
             );
 
             // Yield own value if in range
-            if let Some((k, v)) = unsafe { inner_value_raw(node) } {
-                let kb = k;
-                if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
-                    return Some((kb, v));
-                }
+            if let Some((kb, v)) = unsafe { inner_value_in_lex_range(node, lo, hi) } {
+                return Some((kb, v));
             }
         }
     }
@@ -731,6 +726,21 @@ unsafe fn inner_value_raw<'a, V>(node: NodePtr<V>) -> Option<(&'a [u8], &'a V)> 
         _ => unreachable!(),
     };
     opt.as_ref().map(|(k, v)| (&**k, v))
+}
+
+/// Prefix key stored on an inner node, only if it lies in `[lo, hi]` lexicographically.
+/// `hi` uses the same slice-wise `<=` rule as `range_iter` (full bound key, not a prefix).
+unsafe fn inner_value_in_lex_range<'a, V>(
+    node: NodePtr<V>,
+    lo: Option<&'a [u8]>,
+    hi: Option<&'a [u8]>,
+) -> Option<(&'a [u8], &'a V)> {
+    let (kb, v) = inner_value_raw(node)?;
+    if lo.map_or(true, |lo| kb >= lo) && hi.map_or(true, |hi| kb <= hi) {
+        Some((kb, v))
+    } else {
+        None
+    }
 }
 
 /// Find child by byte key in inner node. Returns NULL if not found.
