@@ -204,6 +204,14 @@ impl<V> Leaf<V> {
         *self.key == *key
     }
 
+    pub(crate) fn get_value(&self, key: &[u8]) -> Option<&V> {
+        if self.matches(key) {
+            Some(&self.value)
+        } else {
+            None
+        }
+    }
+
     pub(crate) fn delete(node: NodePtr<V>, key: &[u8]) -> (NodePtr<V>, bool) {
         if node.as_leaf().matches(key) {
             drop(node.into_leaf_box());

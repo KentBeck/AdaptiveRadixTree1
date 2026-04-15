@@ -55,11 +55,7 @@ impl<V> ARTMap<V> {
 
         while !node.is_null() {
             if node.is_leaf() {
-                let leaf = node.as_leaf();
-                if leaf.matches(key) {
-                    return Some(&leaf.value);
-                }
-                return None;
+                return node.as_leaf().get_value(key);
             }
 
             let prefix = inner_prefix_raw(node);
