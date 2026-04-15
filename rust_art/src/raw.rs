@@ -77,6 +77,16 @@ impl<V> NodePtr<V> {
         (self.0 & !TAG_MASK) as *mut u8
     }
 
+    pub(crate) fn header(&self) -> &NodeHeader<V> {
+        debug_assert!(!self.is_null() && !self.is_leaf());
+        unsafe { &*(self.inner_ptr() as *const NodeHeader<V>) }
+    }
+
+    pub(crate) fn header_mut(&mut self) -> &mut NodeHeader<V> {
+        debug_assert!(!self.is_null() && !self.is_leaf());
+        unsafe { &mut *(self.inner_ptr() as *mut NodeHeader<V>) }
+    }
+
     pub(crate) fn as_node4(&self) -> &Node4<V> {
         debug_assert!(self.kind() == KIND_NODE4);
         unsafe { &*(self.inner_ptr() as *const Node4<V>) }
@@ -148,14 +158,14 @@ impl<V> NodePtr<V> {
         match self.kind() {
             KIND_NODE4 => {
                 let boxed = self.into_node4_box();
-                for i in 0..boxed.count as usize {
+                for i in 0..boxed.header.count as usize {
                     boxed.children[i].drop_recursive();
                 }
                 drop(boxed);
             }
             KIND_NODE16 => {
                 let boxed = self.into_node16_box();
-                for i in 0..boxed.count as usize {
+                for i in 0..boxed.header.count as usize {
                     boxed.children[i].drop_recursive();
                 }
                 drop(boxed);
@@ -191,10 +201,16 @@ pub(crate) struct Leaf<V> {
 
 pub(crate) type InnerValue<V> = Option<(Box<[u8]>, V)>;
 
-pub(crate) struct Node4<V> {
+#[repr(C)]
+pub(crate) struct NodeHeader<V> {
     pub(crate) prefix: Prefix,
     pub(crate) value: InnerValue<V>,
-    pub(crate) count: u8,
+    pub(crate) count: u16,
+}
+
+#[repr(C)]
+pub(crate) struct Node4<V> {
+    pub(crate) header: NodeHeader<V>,
     pub(crate) keys: [u8; 4],
     pub(crate) children: [NodePtr<V>; 4],
 }
@@ -202,19 +218,20 @@ pub(crate) struct Node4<V> {
 impl<V> Node4<V> {
     pub(crate) fn new() -> Self {
         Node4 {
-            prefix: Prefix::empty(),
-            value: None,
-            count: 0,
+            header: NodeHeader {
+                prefix: Prefix::empty(),
+                value: None,
+                count: 0,
+            },
             keys: [0; 4],
             children: [NodePtr::NULL; 4],
         }
     }
 }
 
+#[repr(C)]
 pub(crate) struct Node16<V> {
-    pub(crate) prefix: Prefix,
-    pub(crate) value: InnerValue<V>,
-    pub(crate) count: u8,
+    pub(crate) header: NodeHeader<V>,
     pub(crate) keys: [u8; 16],
     pub(crate) children: [NodePtr<V>; 16],
 }
@@ -222,19 +239,20 @@ pub(crate) struct Node16<V> {
 impl<V> Node16<V> {
     pub(crate) fn new() -> Self {
         Node16 {
-            prefix: Prefix::empty(),
-            value: None,
-            count: 0,
+            header: NodeHeader {
+                prefix: Prefix::empty(),
+                value: None,
+                count: 0,
+            },
             keys: [0; 16],
             children: [NodePtr::NULL; 16],
         }
     }
 }
 
+#[repr(C)]
 pub(crate) struct Node48<V> {
-    pub(crate) prefix: Prefix,
-    pub(crate) value: InnerValue<V>,
-    pub(crate) count: u8,
+    pub(crate) header: NodeHeader<V>,
     pub(crate) index: [u8; 256],
     pub(crate) slots: [NodePtr<V>; 48],
 }
@@ -242,28 +260,31 @@ pub(crate) struct Node48<V> {
 impl<V> Node48<V> {
     pub(crate) fn new() -> Self {
         Node48 {
-            prefix: Prefix::empty(),
-            value: None,
-            count: 0,
+            header: NodeHeader {
+                prefix: Prefix::empty(),
+                value: None,
+                count: 0,
+            },
             index: [0xFF; 256],
             slots: [NodePtr::NULL; 48],
         }
     }
 }
 
+#[repr(C)]
 pub(crate) struct Node256<V> {
-    pub(crate) prefix: Prefix,
-    pub(crate) value: InnerValue<V>,
-    pub(crate) count: u16,
+    pub(crate) header: NodeHeader<V>,
     pub(crate) children: [NodePtr<V>; 256],
 }
 
 impl<V> Node256<V> {
     pub(crate) fn new() -> Self {
         Node256 {
-            prefix: Prefix::empty(),
-            value: None,
-            count: 0,
+            header: NodeHeader {
+                prefix: Prefix::empty(),
+                value: None,
+                count: 0,
+            },
             children: [NodePtr::NULL; 256],
         }
     }
@@ -273,27 +294,27 @@ pub(crate) fn free_inner_node_shell<V>(node: NodePtr<V>) {
     match node.kind() {
         KIND_NODE4 => {
             let mut boxed = node.into_node4_box();
-            boxed.count = 0;
-            boxed.value = None;
+            boxed.header.count = 0;
+            boxed.header.value = None;
             drop(boxed);
         }
         KIND_NODE16 => {
             let mut boxed = node.into_node16_box();
-            boxed.count = 0;
-            boxed.value = None;
+            boxed.header.count = 0;
+            boxed.header.value = None;
             drop(boxed);
         }
         KIND_NODE48 => {
             let mut boxed = node.into_node48_box();
-            boxed.count = 0;
-            boxed.value = None;
+            boxed.header.count = 0;
+            boxed.header.value = None;
             boxed.index = [0xFF; 256];
             drop(boxed);
         }
         KIND_NODE256 => {
             let mut boxed = node.into_node256_box();
-            boxed.count = 0;
-            boxed.value = None;
+            boxed.header.count = 0;
+            boxed.header.value = None;
             for child in boxed.children.iter_mut() {
                 *child = NodePtr::NULL;
             }

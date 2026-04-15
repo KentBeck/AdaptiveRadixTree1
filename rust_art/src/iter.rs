@@ -41,13 +41,13 @@ fn push_children_rev<V>(node: NodePtr<V>, stack: &mut Vec<NodePtr<V>>) {
     match node.kind() {
         KIND_NODE4 => {
             let n = node.as_node4();
-            for i in (0..n.count as usize).rev() {
+            for i in (0..n.header.count as usize).rev() {
                 stack.push(n.children[i]);
             }
         }
         KIND_NODE16 => {
             let n = node.as_node16();
-            for i in (0..n.count as usize).rev() {
+            for i in (0..n.header.count as usize).rev() {
                 stack.push(n.children[i]);
             }
         }
@@ -271,13 +271,13 @@ fn push_range_children_rev<'a, V>(
     match node.kind() {
         KIND_NODE4 => {
             let n = node.as_node4();
-            for i in (0..n.count as usize).rev() {
+            for i in (0..n.header.count as usize).rev() {
                 push(n.keys[i], n.children[i]);
             }
         }
         KIND_NODE16 => {
             let n = node.as_node16();
-            for i in (0..n.count as usize).rev() {
+            for i in (0..n.header.count as usize).rev() {
                 push(n.keys[i], n.children[i]);
             }
         }

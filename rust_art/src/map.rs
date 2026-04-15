@@ -180,7 +180,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
         let sd = depth + common;
 
         let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = Prefix::from_slice(&key[depth..sd]);
+        nn.header.prefix = Prefix::from_slice(&key[depth..sd]);
 
         let mut nn_ptr = NodePtr::from_node4(nn);
 
@@ -206,7 +206,7 @@ fn put_recursive<V>(node: NodePtr<V>, key: &[u8], value: V, depth: usize) -> (No
 
     if ml < plen {
         let mut nn = Box::new(Node4::<V>::new());
-        nn.prefix = Prefix::from_slice(&prefix[..ml]);
+        nn.header.prefix = Prefix::from_slice(&prefix[..ml]);
         let mut nn_ptr = NodePtr::from_node4(nn);
 
         let mut old_node = node;

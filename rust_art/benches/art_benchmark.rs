@@ -25,7 +25,7 @@ fn make_keys(n: usize) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
 
 fn bench_random_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_put");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (_, shuffled) = make_keys(n);
 
         group.bench_with_input(BenchmarkId::new("ART", n), &n, |b, _| {
@@ -53,7 +53,7 @@ fn bench_random_put(c: &mut Criterion) {
 
 fn bench_sequential_put(c: &mut Criterion) {
     let mut group = c.benchmark_group("sequential_put");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (sorted, _) = make_keys(n);
 
         group.bench_with_input(BenchmarkId::new("ART", n), &n, |b, _| {
@@ -81,7 +81,7 @@ fn bench_sequential_put(c: &mut Criterion) {
 
 fn bench_random_get_hit(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_get_hit");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (_, shuffled) = make_keys(n);
 
         let mut tree = ARTMap::new();
@@ -118,7 +118,7 @@ fn bench_random_get_hit(c: &mut Criterion) {
 
 fn bench_random_get_miss(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_get_miss");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (_, shuffled) = make_keys(n);
 
         let mut tree = ARTMap::new();
@@ -155,7 +155,7 @@ fn bench_random_get_miss(c: &mut Criterion) {
 
 fn bench_iterate_all(c: &mut Criterion) {
     let mut group = c.benchmark_group("iterate_all");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (_, shuffled) = make_keys(n);
 
         let mut tree = ARTMap::new();
@@ -194,7 +194,7 @@ fn bench_iterate_all(c: &mut Criterion) {
 
 fn bench_range_query(c: &mut Criterion) {
     let mut group = c.benchmark_group("range_query_1pct");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (_, shuffled) = make_keys(n);
 
         let mut tree = ARTMap::new();
@@ -238,7 +238,7 @@ fn bench_range_query(c: &mut Criterion) {
 
 fn bench_random_delete(c: &mut Criterion) {
     let mut group = c.benchmark_group("random_delete");
-    for &n in &[100_000, 1_000_000, 10_000_000] {
+    for &n in &[100_000, 500_000] {
         let (_, shuffled) = make_keys(n);
 
         let mut del_order = shuffled.clone();
